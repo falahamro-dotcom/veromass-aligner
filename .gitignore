@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+*.xlsx
+*.csv
+raw_convert_cache/
+v18_test_output/
+alignment_log.txt
