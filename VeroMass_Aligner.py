@@ -1621,6 +1621,8 @@ class App(tk.Tk):
         self._total = 0
 
         self._build_ui()
+        if os.environ.get("VEROMASS_OUTPUT_DIR"):
+            self._log("INFO", f"Output folder auto-set for Bridge pickup: {self._outfolder_var.get()}")
         self.after(150, self._poll)
 
     # ── UI construction ───────────────────────────────────────────────────────
@@ -1646,7 +1648,13 @@ class App(tk.Tk):
         inp.pack(fill="x", padx=20, pady=(8, 0))
 
         self._folder_var = tk.StringVar()
-        self._outfolder_var = tk.StringVar()
+        # When launched via "Process locally", veromass-bridge sets
+        # VEROMASS_OUTPUT_DIR to a per-job subfolder of its own watched
+        # folder (watch.py's DEFAULT_DIR) — pre-filling it here means the
+        # scientist never has to know/type that path for the Bridge to
+        # auto-pick-up the finished run. A manual launch (env var unset)
+        # is unchanged — empty, same as before.
+        self._outfolder_var = tk.StringVar(value=os.environ.get("VEROMASS_OUTPUT_DIR", ""))
         self._recurse_var = tk.BooleanVar(value=True)
 
         self._path_row(inp, "Runs folder:", self._folder_var, self._browse_in)
