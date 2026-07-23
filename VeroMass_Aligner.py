@@ -39,7 +39,7 @@ import datetime
 from pathlib import Path
 
 import tkinter as tk
-from tkinter import ttk, filedialog, scrolledtext
+from tkinter import ttk, filedialog, scrolledtext, messagebox
 
 # ═════════════════════════════════════════════════════════════════════════════
 # Auto-install runtime dependencies
@@ -1718,6 +1718,8 @@ class App(tk.Tk):
         self._btn_pause.pack(side="left", padx=(0, 8))
         self._btn_stop = self._btn(btn_f, "⏹  Stop", bg="#2A1520", fg=C_RED, cmd=self._stop, state="disabled")
         self._btn_stop.pack(side="left")
+        self._btn_reset = self._btn(btn_f, "↺  Reset", bg=C_BORDER, fg=C_AMB, cmd=self._reset)
+        self._btn_reset.pack(side="left", padx=(8, 0))
         self._btn_open = self._btn(btn_f, "\U0001F4C2  Open Output Folder", bg=C_BORDER, fg=C_FG, cmd=self._open_out)
         self._btn_open.pack(side="right")
 
@@ -1843,6 +1845,57 @@ class App(tk.Tk):
         self._stop_ev.set()
         self._pause_ev.set()
         self._log("WARN", "Stop requested — finishing current file…")
+
+    def _reset(self):
+        """Wipe out the CURRENT job's in-progress/finished state — log,
+        progress bars, stat cards, and the run thread — so a fresh run can
+        start clean. Does NOT touch the chosen runs/output folder paths,
+        parameter fields, any file already written to disk, or anything
+        outside this one GUI's own in-memory state (no other job, workbench,
+        or committed cloud result is reachable from here)."""
+        if self._thread is not None and self._thread.is_alive():
+            if not messagebox.askyesno(
+                "Reset current job",
+                "A run is currently in progress. Stop it and reset?",
+            ):
+                return
+            self._log("WARN", "Reset requested — stopping current run first…")
+            self._stop_ev.set()
+            self._pause_ev.set()
+            self._btn_reset["state"] = "disabled"
+            self.after(200, self._wait_for_stop_then_reset)
+            return
+        self._do_reset()
+
+    def _wait_for_stop_then_reset(self):
+        if self._thread is not None and self._thread.is_alive():
+            self.after(200, self._wait_for_stop_then_reset)
+            return
+        self._btn_reset["state"] = "normal"
+        self._do_reset()
+
+    def _do_reset(self):
+        self._thread = None
+        self._total = 0
+        self._stop_ev.clear()
+        self._pause_ev.set()
+
+        for sv in (self._sv_processed, self._sv_total, self._sv_peaks):
+            sv["text"] = "0"
+        self._sv_eta["text"] = "—"
+        self._pb["value"] = 0
+        self._pb_lbl["text"] = "0 / 0  (0%)"
+
+        self._log_w.configure(state="normal")
+        self._log_w.delete("1.0", "end")
+        self._log_w.configure(state="disabled")
+
+        self._btn_start["state"] = "normal"
+        self._btn_pause["state"] = "disabled"
+        self._btn_pause["text"] = "⏸  Pause"
+        self._btn_stop["state"] = "disabled"
+
+        self._log("INFO", "Job reset. Ready for a new run.")
 
     # ── Queue polling ─────────────────────────────────────────────────────────
     def _poll(self):
