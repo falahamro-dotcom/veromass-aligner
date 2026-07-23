@@ -52,15 +52,15 @@ UI, `_ensure_deps()` runtime pip bootstrap, background-thread processing with
    scans, then does Gaussian-smoothed multi-scale local-maxima picking along
    each ROI's RT-intensity trace, producing per-file chromatographic peaks
    (m/z/RT apex + bounds, height, area, S/N).
-4. **Correspondence** (`group_peaks`) — two-stage grouping across all samples'
-   peaks: m/z-tolerance bucketing, then RT-density clustering within each
-   bucket. Produces cross-sample features with size/m.z/RT/width/shape-distance
-   stats.
+4. **Correspondence** (`group_peaks_density` since v1.8.0; legacy `group_peaks`
+   retained) — coarse m/z gap-partitioning, then intensity-weighted KDE density
+   clustering over RT within each slice. Produces cross-sample features with
+   size/m.z/RT/width/shape-distance stats.
 5. **RT correction** (`compute_rt_correction` / `apply_rt_correction`) —
-   anchor features present in most samples get a per-sample local-quadratic
-   RT correction curve fit, applied to all peaks.
-6. **Re-grouping** — `group_peaks` re-run on RT-corrected peaks for the final
-   aligned feature table.
+   anchor features present in most samples get a per-sample loess RT correction
+   curve (with linear extrapolation past the anchor range), applied to all peaks.
+6. **Re-grouping** — `group_peaks_density` re-run on RT-corrected peaks for the
+   final aligned feature table.
 7. **MS2 attachment** (`attach_ms2`) — for each feature, MS2 is looked up
    **only in its representative sample** (the sample with the highest peak
    height for that feature), matched by precursor m/z within grouping
@@ -244,11 +244,87 @@ downstream, in `group_peaks`'s correspondence clustering:
   is the exact class of bug this fix addressed, and it silently corrupts
   results that look fine in isolation but break under real peak density.
 
+## v1.8.0 — density-based correspondence + real loess RT correction
+
+The order-dependent "bucket stealing" left open at v1.7.0 was reworked properly.
+`group_peaks` (seed-window scheme) is retained but no longer the default;
+correspondence now runs through `group_peaks_density` / `_density_cluster_bin`,
+the same family of algorithm xcms's `PeakDensityParam` uses:
+
+- Coarse m/z partitioning via gap-splitting (safe here — fine separation is
+  delegated to the RT-density step, not the gap threshold). **Do NOT gap-split
+  the RT step** — a mid-development attempt to gap-split BOTH axes is
+  mathematically single-linkage/chain clustering and measured markedly worse
+  (54.3% match, `size>2` reappeared). Reverted.
+- Within each m/z slice: build an intensity-weighted Gaussian KDE over RT
+  (bandwidth `rt_bw_sec`), take the global density maximum, capture points
+  within `rt_capture_mult * bw`, enforce one-peak-per-sample. No seed, no
+  greedy first-mover — assignment falls out of the aggregate density shape, so
+  processing order provably cannot change the result.
+- `compute_rt_correction` replaced its global degree-2 polyfit (which *clamped*
+  RT at the anchor-range edges — worst exactly where correction is needed most)
+  with a real loess (`_loess_curve`, tricube kernel, span=0.2, matching xcms's
+  `smooth="loess"`) plus *linear extrapolation* past the anchor range.
+
+Verified against the real reference report (60,512 features, two real
+positive-mode files): match 73.1%->73.5%, RT bias +0.065->+0.0001 min, RT std
+0.145->0.134, illegal `size>2` in a 2-sample run 32,063->0. Cost: correspondence
+~10s->~115s per pass (accepted — accuracy was the priority).
+
+## v1.8.1 — silent-drop correctness fix + the accuracy ceiling was mapped
+
+Independently re-verified all v1.8.0 numbers to the digit (isolated path AND the
+real `run_alignment` end-to-end path, incl. the exported workbook: 73.5%,
+size2=8,923, size>2=0). Then two things were found and one fixed:
+
+1. **Silent-drop bug in `_density_cluster_bin` (FIXED).** The peeling loop
+   removed ALL captured peaks from the pool but only emitted the per-sample
+   *winners*; same-sample non-winners were silently discarded — real detected
+   chromatographic peaks that never reached the output, contradicting the
+   function's own docstring (step 4: "return the rest to the pool"). Measured
+   discard: **2,912 peaks (1.3%) at `rt_capture_mult=0.1`, 86,770 (37.6%) at
+   0.5.** This radius-dependent bleed is exactly why narrower `rt_capture_mult`
+   always won in tuning — it was not a true optimum, just less dropped signal.
+   Fix: remove only the kept winners; leave non-winners in the pool for a later
+   density maximum. Re-verified: match 73.51%->73.54%, features
+   219,128->221,989 (recovered signal), `size>2` still 0. The residual reason
+   0.1 still edges 0.5 even after the fix (73.54 vs 72.08) is *legitimate* —
+   a too-wide radius folds genuinely distinct nearby compounds into one density
+   maximum — so **`rt_capture_mult=0.1` stays the default.**
+
+2. **Correspondence is at its detection ceiling — the match rate is NOT a
+   correspondence problem.** Of the 16,027 unmatched reference features, **99.2%
+   are detection misses** (no raw peak within 30ppm/0.5min); only 0.8% (123) are
+   lost in grouping. Raw-peak ceiling @30ppm/0.5 = 73.7%, grouping achieves
+   73.5%. Further correspondence work will not move the match rate.
+
+3. **The "73.5%" metric is heavily coincidence-inflated.** A decoy control
+   (permute reference RT, keep m/z, re-match) shows a **31.9% coincidence floor**
+   at the tightest tolerance — because the tool emits 219k features vs the
+   reference's 60k (3.6x). True agreement above chance is ~42%. Widening the
+   match tolerance recovers *no* real signal (true signal falls). The lever is
+   **detection over-production** (mostly narrow spikes the reference's
+   `peakwidth=c(9.4,32)` rejects), which is a recall/precision tradeoff the
+   scientist must weigh — do NOT unilaterally tighten detection (the tool exists
+   because a scientist wanted MORE recall).
+
+**Reference-file column semantics (previously unresolved):** `rtmed` is in
+MINUTES; `mean` = exact arithmetic mean of the two per-sample columns; `npeaks`
+= count of *actually detected* peaks (the per-sample intensity matrix is
+`fillChromPeaks`-backfilled, so a feature can be npeaks==1 yet have both columns
+populated); no systematic m/z bias (signed ppm err +0.00). The `maxint` vs
+per-sample-column relationship is *not* a constant transform (consistent with
+apex-height `maxo` vs integrated-area `into`, but a bright row implies an
+impossible 11,000-scan peak width) — still needs the scientist's export-script
+definition to fully close. The paper's `RT < 1020s` cutoff does NOT explain the
+misses (rt<17min matches 73.4%, rt>=17 matches 77.5%) — that lead is closed.
+
 ## Known limitations / not yet implemented
 
-- RT correction uses a local-quadratic polyfit stand-in for loess — fine for
-  moderate RT drift, may need a real loess (e.g. `statsmodels.lowess`) if
-  drift is large/nonlinear.
+- RT correction uses a real loess (`_loess_curve`, tricube-weighted local
+  linear regression, span=0.2) with linear extrapolation past the anchor range,
+  as of v1.8.0 (was previously a global degree-2 polyfit that clamped at the
+  edges).
 - No isotope/adduct-aware charge detection — `Charge` is hardcoded to 1 and
   `Mass` assumes `[M+H]+`.
 - **Peak-detection performance (v1.2.0 rewrite — the important one)**: the

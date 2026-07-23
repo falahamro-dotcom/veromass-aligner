@@ -68,7 +68,7 @@ from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
 # Constants
 # ═════════════════════════════════════════════════════════════════════════════
 TOOL_NAME     = "VeroMass Aligner"
-VERSION       = "1.8.0"
+VERSION       = "1.8.1"
 OUTPUT_SUBDIR = "VeroMass_Aligner_Output"
 MS_EXTS = (".mzml", ".mzxml", ".raw", ".mgf")   # directly-readable MS files
 ARCHIVE_EXTS = (".zip",)                          # extracted, then scanned for MS_EXTS
@@ -997,8 +997,27 @@ def _density_cluster_bin(peaks, n_samples, bw_min, min_frac_samples, capture_mul
         if n_in / max(n_samples, 1) >= min_frac_samples:
             clusters.append(cluster)
 
-        captured_set = set(captured_idx)
-        remaining = [p for k, p in enumerate(remaining) if k not in captured_set]
+        # Remove ONLY the kept per-sample winners from the pool. The same-sample
+        # NON-winners that fell inside the capture radius are deliberately left in
+        # `remaining` so a later density maximum can claim them — they may be a
+        # distinct nearby compound (e.g. an isomer) that deserves its own cluster,
+        # exactly as this function's docstring (step 4) describes.
+        #
+        # The previous line removed ALL captured indices, silently discarding
+        # those non-winners: real detected chromatographic peaks that then never
+        # reached the output — the cardinal sin for this tool (an undetected /
+        # dropped feature is unrecoverable downstream). Measured on the two real
+        # reference files: 2,912 peaks (1.3%) were discarded at capture_mult=0.1
+        # and 86,770 (37.6%) at 0.5. That radius-dependent bleed is precisely why
+        # a narrower capture radius always scored better in tuning — it was not
+        # finding a true optimum, only dropping less real signal. Verified against
+        # the real reference report after this fix: match 73.51%->73.54%, features
+        # 219,128->221,989 (recovered signal), and still zero structurally-illegal
+        # size>2 clusters in a 2-sample run. Termination is still guaranteed: the
+        # kept-winner set is always non-empty, so `remaining` strictly shrinks
+        # every iteration.
+        kept_ids = {id(p) for p in cluster}
+        remaining = [p for p in remaining if id(p) not in kept_ids]
 
     return clusters
 
