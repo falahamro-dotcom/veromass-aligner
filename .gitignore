@@ -5,3 +5,9 @@ __pycache__/
 raw_convert_cache/
 v18_test_output/
 alignment_log.txt
+
+# PyInstaller build artifacts — rebuilt from source, not checked in (built
+# exes get attached to GitHub Releases via the veromass-bridge repo instead).
+build/
+dist/
+*.spec
