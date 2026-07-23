@@ -1594,7 +1594,21 @@ def write_feature_table(features, sample_names, out_dir):
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title(f"{TOOL_NAME}  v{VERSION}")
+        # When launched via "Process locally" (veromass-bridge/launcher.py),
+        # these env vars carry the Workbench/Job name AND id the scientist
+        # already sees in app.veromass.com — shown here so the desktop run
+        # is visibly the same job, not just silently linked by a UUID the
+        # commit path already guarantees underneath. Unset on a normal
+        # manual launch (`python VeroMass_Aligner.py`) — title/UI are then
+        # unchanged from before.
+        self._linked_workbench_name = os.environ.get("VEROMASS_WORKBENCH_NAME") or None
+        self._linked_job_name = os.environ.get("VEROMASS_JOB_NAME") or None
+        self._linked_job_id = os.environ.get("VEROMASS_JOB_ID") or None
+
+        title = f"{TOOL_NAME}  v{VERSION}"
+        if self._linked_job_name or self._linked_workbench_name:
+            title += f"  —  {self._linked_workbench_name or '?'} / {self._linked_job_name or '(untitled job)'}"
+        self.title(title)
         self.geometry("1000x780")
         self.minsize(860, 640)
         self.configure(bg=C_BG)
@@ -1617,6 +1631,15 @@ class App(tk.Tk):
                  font=("Segoe UI", 17, "bold")).pack(side="left")
         tk.Label(tf, text=f" v{VERSION}  ·  VeroMass / MoleculeID Platform  ·  Standalone Utility",
                  bg=C_BG, fg=C_DIM, font=("Segoe UI", 9)).pack(side="left", padx=8)
+
+        if self._linked_job_name or self._linked_workbench_name:
+            short_id = f"…{self._linked_job_id[-8:]}" if self._linked_job_id else ""
+            tk.Label(
+                tf,
+                text=f"  Linked to: {self._linked_workbench_name or '?'} → "
+                     f"{self._linked_job_name or '(untitled job)'} ({short_id})",
+                bg=C_BG, fg=C_TEAL, font=("Segoe UI", 9, "bold"),
+            ).pack(side="left", padx=(12, 0))
 
         # ── Input ──
         inp = self._section("  Input  ")
