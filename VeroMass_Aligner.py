@@ -1609,8 +1609,21 @@ class App(tk.Tk):
         if self._linked_job_name or self._linked_workbench_name:
             title += f"  —  {self._linked_workbench_name or '?'} / {self._linked_job_name or '(untitled job)'}"
         self.title(title)
-        self.geometry("1000x780")
-        self.minsize(860, 640)
+        # A fixed "1000x780" put the bottom button bar (Start/Pause/
+        # Reset/Open Output Folder) off-screen on smaller/lower-resolution
+        # displays — the window simply extended past the visible desktop
+        # area (behind the taskbar or off the bottom edge entirely), and a
+        # user had to manually drag-resize or maximize to ever see those
+        # buttons. Size relative to the REAL screen instead, capped at the
+        # old 1000x780 on large displays, and center it — the whole window
+        # (buttons included) is now always inside the visible screen at
+        # launch, on any display, with zero manual resizing needed.
+        screen_w, screen_h = self.winfo_screenwidth(), self.winfo_screenheight()
+        win_w = min(1000, int(screen_w * 0.92))
+        win_h = min(780, int(screen_h * 0.88))
+        x, y = (screen_w - win_w) // 2, (screen_h - win_h) // 2
+        self.geometry(f"{win_w}x{win_h}+{x}+{y}")
+        self.minsize(min(860, win_w), min(640, win_h))
         self.configure(bg=C_BG)
 
         self._stop_ev = threading.Event()

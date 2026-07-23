@@ -1,8 +1,14 @@
 @echo off
 REM ─────────────────────────────────────────────────────────────────────────────
-REM  VeroMass Aligner  v1.7.0
+REM  VeroMass Aligner
 REM  VeroMass / MoleculeID Platform — Standalone Utility
-REM  Double-click this file to launch VeroMass Aligner.
+REM
+REM  This launcher always shows a black console window for its whole
+REM  run — that's inherent to .bat files (they run inside a real console
+REM  host), not fixable from in here. For normal use, double-click
+REM  Start_VeroMass_Aligner_Windows.vbs instead — it launches the exact
+REM  same thing with zero console flash. Use THIS .bat only if that one
+REM  doesn't work and you need to see real error output.
 REM ─────────────────────────────────────────────────────────────────────────────
 
 cd /d "%~dp0"
