@@ -1742,20 +1742,20 @@ class App(tk.Tk):
         self._pb_lbl = tk.Label(pb_f, text="0 / 0  (0%)", bg=C_BG, fg=C_SUB, font=("Segoe UI", 8))
         self._pb_lbl.pack(pady=(2, 6))
 
-        # ── Log ──
-        log_sec = self._section("  Log  ")
-        log_sec.pack(fill="both", expand=True, padx=20, pady=(8, 0))
-        self._log_w = scrolledtext.ScrolledText(
-            log_sec, bg="#080E1A", fg=C_SUB, font=("Consolas", 8),
-            relief="flat", state="disabled", wrap="word",
-        )
-        self._log_w.pack(fill="both", expand=True, padx=6, pady=6)
-        for tag, col in (("INFO", C_SUB), ("OK", C_TEAL), ("WARN", C_AMB), ("ERROR", C_RED)):
-            self._log_w.tag_config(tag, foreground=col)
-
-        # ── Buttons ──
+        # ── Buttons ── packed BEFORE the Log section, anchored to the
+        # window's bottom edge (side="bottom"). Tkinter's pack manager
+        # allocates space to already-packed widgets first; the Log section
+        # below has fill="both"/expand=True, which — when packed FIRST, as
+        # it used to be — claims all available space at layout time and
+        # pushes whatever is packed after it (this button row) out of the
+        # visible window entirely on any display too short to fit
+        # everything at full size. Packing the buttons first (and anchoring
+        # them to the bottom rather than relying on top-down stacking order
+        # alone) guarantees they always get their own space; Log then only
+        # ever fills whatever room is actually left over, shrinking or
+        # scrolling instead of hiding the controls.
         btn_f = tk.Frame(self, bg=C_BG)
-        btn_f.pack(fill="x", padx=20, pady=12)
+        btn_f.pack(side="bottom", fill="x", padx=20, pady=12)
         self._btn_start = self._btn(btn_f, "▶  Start", bg=C_TEAL, fg="#000000", bold=True, cmd=self._start)
         self._btn_start.pack(side="left", padx=(0, 8))
         self._btn_pause = self._btn(btn_f, "⏸  Pause", bg=C_BORDER, fg=C_FG, cmd=self._toggle_pause, state="disabled")
@@ -1766,6 +1766,17 @@ class App(tk.Tk):
         self._btn_reset.pack(side="left", padx=(8, 0))
         self._btn_open = self._btn(btn_f, "\U0001F4C2  Open Output Folder", bg=C_BORDER, fg=C_FG, cmd=self._open_out)
         self._btn_open.pack(side="right")
+
+        # ── Log ──
+        log_sec = self._section("  Log  ")
+        log_sec.pack(fill="both", expand=True, padx=20, pady=(8, 0))
+        self._log_w = scrolledtext.ScrolledText(
+            log_sec, bg="#080E1A", fg=C_SUB, font=("Consolas", 8),
+            relief="flat", state="disabled", wrap="word",
+        )
+        self._log_w.pack(fill="both", expand=True, padx=6, pady=6)
+        for tag, col in (("INFO", C_SUB), ("OK", C_TEAL), ("WARN", C_AMB), ("ERROR", C_RED)):
+            self._log_w.tag_config(tag, foreground=col)
 
     # ── Widget helpers ────────────────────────────────────────────────────────
     def _section(self, title):
