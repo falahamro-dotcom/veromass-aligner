@@ -70,7 +70,7 @@ from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
 # Constants
 # ═════════════════════════════════════════════════════════════════════════════
 TOOL_NAME     = "VeroMass Aligner"
-VERSION       = "1.9.0"
+VERSION       = "1.10.0"
 OUTPUT_SUBDIR = "VeroMass_Aligner_Output"
 MS_EXTS = (".mzml", ".mzxml", ".raw", ".mgf")   # directly-readable MS files
 ARCHIVE_EXTS = (".zip",)                          # extracted, then scanned for MS_EXTS
