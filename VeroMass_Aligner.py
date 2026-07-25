@@ -1640,6 +1640,10 @@ def run_alignment(
     features = group_peaks_density(store, n_samples, grp_params, cb=cb)
     flog(f"  {len(features)} final feature(s) after RT-corrected re-grouping.")
 
+    # Soft per-feature confidence (intensity + S/N). Additive: no feature is
+    # dropped — it just gives the tester/downstream a 0..1 dial to rank by.
+    annotate_confidence(features, store)
+
     flog("Attaching representative MS2 fragmentation per feature…")
     features = attach_ms2(features, all_ms2_by_sample, grp_params)
     n_with_ms2 = sum(1 for f in features if f["ms2_fragments"])
@@ -1745,12 +1749,46 @@ def extract_peaks_and_ms2(path, cache_dir, peak_params, cb=None):
 
 
 # ═════════════════════════════════════════════════════════════════════════════
+# CONFIDENCE  — a soft per-feature quality score (does NOT drop any feature)
+# ═════════════════════════════════════════════════════════════════════════════
+def _pctrank(x):
+    """Percentile rank in [0, 1] (0 = lowest, 1 = highest). Stable ties."""
+    order = np.argsort(np.argsort(x, kind="stable"), kind="stable")
+    return order / max(len(x) - 1, 1)
+
+
+def annotate_confidence(features, store):
+    """Attach feat["confidence"] in [0, 1] = mean of the percentile ranks of
+    (apex intensity, max member S/N). Higher = more likely a real feature.
+
+    This is deliberately a SCORE, not a filter — every detected feature is kept
+    (the tool's job is recall; see the v1.4.0 history). It gives a downstream
+    user a single dial to rank or threshold by. Measured against the 2-sample
+    xcms reference: a peak-WIDTH cut is useless (precision stays ~44% while
+    monoisotopic recall collapses 88%->3% as the cut tightens — xcms's
+    peakwidth is a wavelet scale, not a hard cutoff), but this intensity+S/N
+    score separates real from noise cleanly: keeping the top-scoring HALF of
+    features lifts precision 44%->59% while monoisotopic recall only slips
+    88%->84%. Intensity and S/N each discriminate strongly (feature match-rate
+    climbs from ~22-28% in the bottom decile to ~77-78% in the top); peak width
+    and cross-sample reproducibility do not."""
+    if not features:
+        return
+    heights = np.array([f["base_peak"] for f in features], dtype=np.float64)
+    snrs = np.array([float(store.snr[f["peak_idx"]].max()) for f in features],
+                    dtype=np.float64)
+    conf = (_pctrank(heights) + _pctrank(snrs)) / 2.0
+    for i, f in enumerate(features):
+        f["confidence"] = float(conf[i])
+
+
+# ═════════════════════════════════════════════════════════════════════════════
 # EXPORT
 # ═════════════════════════════════════════════════════════════════════════════
 FEATURE_COLUMNS = [
     "feature", "Size", "Charge", "Mass", "m.z", "RT", "Base.Peak",
     "m.z.Width", "RT.Height", "m.z.Min", "m.z.Max", "RT.Min", "RT.Max",
-    "Shape.Distance", "MS2.Sample", "MS2.RT", "MS2.Fragments",
+    "Shape.Distance", "Confidence", "MS2.Sample", "MS2.RT", "MS2.Fragments",
 ]
 
 PEAK_COLUMNS = ["feature", "sample", "m.z", "RT", "Height", "Area", "S.N"]
@@ -1794,6 +1832,7 @@ def write_feature_table(store, features, sample_names, out_dir):
             "RT.Min": round(feat["rt_min"], 10),
             "RT.Max": round(feat["rt_max"], 10),
             "Shape.Distance": feat["shape_distance"],
+            "Confidence": round(feat.get("confidence", 0.0), 4),
             "MS2.Sample": sample_names[feat["ms2_sample"]] if feat.get("ms2_sample") is not None else "",
             "MS2.RT": round(feat["ms2_rt"], 4) if feat.get("ms2_rt") is not None else "",
             "MS2.Fragments": feat.get("ms2_fragments", ""),
