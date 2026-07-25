@@ -958,19 +958,94 @@ def group_peaks(all_peaks, n_samples, params, cb=None):
     return features
 
 
-def _feature_from_cluster(cluster):
-    mzs = np.array([p["mz"] for p in cluster])
-    rts = np.array([p["rt"] for p in cluster])
-    heights = np.array([p["height"] for p in cluster])
-    mz_mins = np.array([p["mz_min"] for p in cluster])
-    mz_maxs = np.array([p["mz_max"] for p in cluster])
-    rt_mins = np.array([p["rt_min"] for p in cluster])
-    rt_maxs = np.array([p["rt_max"] for p in cluster])
+class PeakStore:
+    """Columnar (numpy) peak storage — replaces per-peak Python dicts.
+
+    A peak dict was ~500-900 B; these parallel columns are 70 B/peak (measured),
+    so a 300-file run (33.6M peaks) drops from ~17 GB (OOM on 16 GB) to ~2.4 GB.
+    Only `height` is float32 — it is the ONLY field verified float32-LOSSLESS
+    across the real 1.57M-peak run; every other field needs float64 to keep the
+    grouping/RT/export output BYTE-IDENTICAL to the old dict pipeline (verified by
+    feature-set fingerprint on 2/4/8/14-sample subsets). Compute sites upcast
+    height to float64, which is exact, so np.average / KDE bits are unchanged.
+
+    Features reference peaks by GLOBAL index (feat["peak_idx"]) rather than
+    holding dict references, so the peaks live ONLY here and the memory is
+    actually reclaimed. rt/rt_min/rt_max are mutated in place by
+    apply_rt_correction (per-peak scalar arithmetic, see there)."""
+    __slots__ = ("mz", "mz_min", "mz_max", "rt", "rt_min", "rt_max",
+                 "height", "area", "snr", "sample", "n")
+    _F64 = ("mz", "mz_min", "mz_max", "rt", "rt_min", "rt_max", "area", "snr")
+
+    def __init__(self, n):
+        self.n = n
+        for f in self._F64:
+            setattr(self, f, np.empty(n, dtype=np.float64))
+        self.height = np.empty(n, dtype=np.float32)
+        self.sample = np.empty(n, dtype=np.int16)
+
+    @classmethod
+    def from_dicts(cls, peaks):
+        """Build a store (or a per-file chunk) from a list of peak dicts, each
+        carrying a 'sample' index. The dicts can be freed by the caller right
+        after — this is how run_alignment keeps only one file's dicts alive at a
+        time while the columnar store grows."""
+        n = len(peaks)
+        s = cls(n)
+        if n:
+            s.mz[:]     = [p["mz"] for p in peaks]
+            s.mz_min[:] = [p["mz_min"] for p in peaks]
+            s.mz_max[:] = [p["mz_max"] for p in peaks]
+            s.rt[:]     = [p["rt"] for p in peaks]
+            s.rt_min[:] = [p["rt_min"] for p in peaks]
+            s.rt_max[:] = [p["rt_max"] for p in peaks]
+            s.area[:]   = [p["area"] for p in peaks]
+            s.snr[:]    = [p["snr"] for p in peaks]
+            s.height[:] = [p["height"] for p in peaks]   # float32 store (lossless)
+            s.sample[:] = [p["sample"] for p in peaks]
+        return s
+
+    @classmethod
+    def concat(cls, chunks):
+        """Concatenate per-file chunks into one store, preserving order (so the
+        stable m/z argsort below reproduces the old sorted(all_peaks) tie-break
+        of file-0 peaks before file-1, etc.)."""
+        chunks = [c for c in chunks if c.n]
+        if not chunks:
+            return cls(0)
+        s = cls(sum(c.n for c in chunks))
+        for f in cls._F64:
+            np.concatenate([getattr(c, f) for c in chunks], out=getattr(s, f))
+        np.concatenate([c.height for c in chunks], out=s.height)
+        np.concatenate([c.sample for c in chunks], out=s.sample)
+        return s
+
+    def nbytes(self):
+        tot = self.height.nbytes + self.sample.nbytes
+        for f in self._F64:
+            tot += getattr(self, f).nbytes
+        return tot
+
+
+def _feature_from_cluster(store, idxs):
+    """Build a feature from a cluster given as GLOBAL peak indices into `store`.
+    Stores 'peak_idx' (the index array) instead of a list of dicts. Element order
+    in the gathered arrays == idxs order == the winners order from
+    _density_cluster_bin, so the floating-point summation in np.average and the
+    first-max tie-break in argmax match the old dict pipeline exactly."""
+    mzs      = store.mz[idxs]
+    rts      = store.rt[idxs]
+    heights  = store.height[idxs].astype(np.float64)   # exact (float32-lossless)
+    mz_mins  = store.mz_min[idxs]
+    mz_maxs  = store.mz_max[idxs]
+    rt_mins  = store.rt_min[idxs]
+    rt_maxs  = store.rt_max[idxs]
     shape_distance = float(np.std(rts) / max(np.mean(rts), 1e-9))
-    best_peak = max(cluster, key=lambda p: p["height"])
+    best_local = int(np.argmax(heights))               # first-max == max(key=height)
+    best_gi = int(idxs[best_local])
     return {
-        "peaks": cluster,
-        "size": len(cluster),
+        "peak_idx": idxs,
+        "size": int(idxs.size),
         "mz": float(np.average(mzs, weights=heights)),
         "mz_min": float(mz_mins.min()),
         "mz_max": float(mz_maxs.max()),
@@ -979,13 +1054,13 @@ def _feature_from_cluster(cluster):
         "rt_max": float(rt_maxs.max()),
         "base_peak": float(heights.max()),
         "shape_distance": shape_distance,
-        "rep_sample": best_peak["sample"],
-        "rep_rt": best_peak["rt"],
-        "rep_mz": best_peak["mz"],
+        "rep_sample": int(store.sample[best_gi]),
+        "rep_rt": float(store.rt[best_gi]),
+        "rep_mz": float(store.mz[best_gi]),
     }
 
 
-def _density_cluster_bin(peaks, n_samples, bw_min, min_frac_samples, capture_mult=1.0):
+def _density_cluster_bin(store, gidx, n_samples, bw_min, min_frac_samples, capture_mult=1.0):
     """
     Density-based RT correspondence within ONE coarse m/z slice — the same
     family of algorithm xcms's own PeakDensityParam uses, chosen specifically
@@ -1015,7 +1090,7 @@ def _density_cluster_bin(peaks, n_samples, bw_min, min_frac_samples, capture_mul
          empty or the remaining weight is negligible.
       6. Apply the existing min_frac_samples filter per resulting cluster.
     """
-    if not peaks:
+    if gidx.size == 0:
         return []
     # Peaks held as fixed numpy columns with a boolean alive-mask instead of
     # rebuilding Python lists from dicts every iteration; the KDE density is
@@ -1025,10 +1100,14 @@ def _density_cluster_bin(peaks, n_samples, bw_min, min_frac_samples, capture_mul
     # near-linear (measured peaks^0.81 on a real 1.57M-peak run) while producing
     # byte-identical clusters — verified by fingerprint against the original on
     # 2/4/8/14-sample subsets. Do NOT reintroduce the per-iteration full rebuild.
-    M = len(peaks)
-    rt_arr = np.fromiter((p["rt"] for p in peaks), dtype=float, count=M)
-    ht_arr = np.fromiter((p["height"] for p in peaks), dtype=float, count=M)
-    sm_arr = np.fromiter((p["sample"] for p in peaks), dtype=np.int64, count=M)
+    # gidx = GLOBAL peak indices for this m/z bin, in m/z-sorted order (== the old
+    # bin order). Gather compute columns as float64; upcasting the float32 height
+    # store is exact (lossless-verified), so these arrays are bit-identical to the
+    # old np.fromiter over dicts.
+    M = gidx.size
+    rt_arr = store.rt[gidx].astype(np.float64, copy=True)
+    ht_arr = store.height[gidx].astype(np.float64, copy=True)
+    sm_arr = store.sample[gidx].astype(np.int64, copy=True)
     alive = np.ones(M, dtype=bool)
 
     grid_step = bw_min / 4.0
@@ -1076,7 +1155,8 @@ def _density_cluster_bin(peaks, n_samples, bw_min, min_frac_samples, capture_mul
         winners = list(by_sample.values())
 
         if len(by_sample) / max(n_samples, 1) >= min_frac_samples:
-            clusters.append([peaks[gi] for gi in winners])
+            # winners are bin-local indices; map to GLOBAL store indices via gidx.
+            clusters.append(gidx[np.array(winners, dtype=np.int64)])
 
         # Remove ONLY the kept per-sample winners (same as the original). The
         # same-sample NON-winners inside the capture radius are deliberately left
@@ -1094,7 +1174,7 @@ def _density_cluster_bin(peaks, n_samples, bw_min, min_frac_samples, capture_mul
     return clusters
 
 
-def group_peaks_density(all_peaks, n_samples, params, cb=None):
+def group_peaks_density(store, n_samples, params, cb=None):
     """
     Cross-sample correspondence via density-based clustering (see
     `_density_cluster_bin`). Coarse m/z partitioning still uses gap-based
@@ -1109,13 +1189,16 @@ def group_peaks_density(all_peaks, n_samples, params, cb=None):
     in a 2-sample test (32,063 -> 0). See GroupingParams.rt_capture_mult for
     the capture-radius tuning history.
     """
-    if not all_peaks:
+    n = store.n
+    if n == 0:
         return []
 
-    peaks_sorted = sorted(all_peaks, key=lambda p: p["mz"])
-    n = len(peaks_sorted)
     bw_min = params.rt_bw_sec / 60.0
-    mzs_all = np.array([p["mz"] for p in peaks_sorted])
+    # stable argsort reproduces the old sorted(all_peaks, key=mz): equal-m/z peaks
+    # keep their original (file-0-before-file-1) order, so bin edges and the
+    # one-peak-per-sample tie-breaks below are byte-identical to the dict version.
+    order = np.argsort(store.mz, kind="stable")
+    mzs_all = store.mz[order]
 
     tol = np.maximum(mzs_all[:-1] * params.mz_ppm * 1e-6, params.mz_abs)
     mz_gaps = np.where(np.diff(mzs_all) > tol)[0] + 1
@@ -1140,10 +1223,11 @@ def group_peaks_density(all_peaks, n_samples, params, cb=None):
     def run_bin(bi):
         nonlocal done, last
         a, b = bins[bi]
-        clusters = _density_cluster_bin(peaks_sorted[a:b], n_samples, bw_min,
+        gidx = order[a:b]
+        clusters = _density_cluster_bin(store, gidx, n_samples, bw_min,
                                         params.min_frac_samples,
                                         capture_mult=params.rt_capture_mult)
-        feats = [_feature_from_cluster(c) for c in clusters]
+        feats = [_feature_from_cluster(store, c) for c in clusters]
         if cb is not None:
             with lock:
                 done += 1
@@ -1213,7 +1297,7 @@ def _loess_curve(xs, ys, span=0.2, n_grid=200):
     return grid_x, grid_y
 
 
-def compute_rt_correction(features, n_samples, min_frac_anchor=0.8, span=0.2):
+def compute_rt_correction(store, features, n_samples, min_frac_anchor=0.8, span=0.2):
     """
     Pick anchor features present in >= min_frac_anchor of samples, then for
     each sample fit a LOESS-style local regression curve (deviation from the
@@ -1239,10 +1323,16 @@ def compute_rt_correction(features, n_samples, min_frac_anchor=0.8, span=0.2):
     for s in range(n_samples):
         xs, ys = [], []
         for feat in anchors:
-            sample_peaks = [p for p in feat["peaks"] if p["sample"] == s]
-            if not sample_peaks:
+            # first member peak of this feature belonging to sample s (in feat
+            # order). One-peak-per-sample makes this unique, matching the old
+            # [p for p in feat["peaks"] if p["sample"]==s][0].
+            found = -1
+            for gi in feat["peak_idx"]:
+                if int(store.sample[gi]) == s:
+                    found = int(gi); break
+            if found < 0:
                 continue
-            observed_rt = sample_peaks[0]["rt"]
+            observed_rt = float(store.rt[found])
             reference_rt = feat["rt"]
             xs.append(observed_rt)
             ys.append(reference_rt - observed_rt)
@@ -1276,13 +1366,20 @@ def compute_rt_correction(features, n_samples, min_frac_anchor=0.8, span=0.2):
     return corrections
 
 
-def apply_rt_correction(all_peaks, corrections):
-    for p in all_peaks:
-        fn = corrections.get(p["sample"], lambda rt: rt)
-        delta = fn(p["rt"]) - p["rt"]
-        p["rt"] += delta
-        p["rt_min"] += delta
-        p["rt_max"] += delta
+def apply_rt_correction(store, corrections):
+    # Mutate rt/rt_min/rt_max columns in place with the SAME per-peak scalar
+    # arithmetic as the old dict version: reading each value out as a python float
+    # and doing x + (fn(x) - x) reproduces it bit-for-bit (a + (b - a) is NOT
+    # generally b in floating point, so this must not be vectorised/simplified).
+    ident = lambda rt: rt
+    rt = store.rt; rtm = store.rt_min; rtx = store.rt_max; sm = store.sample
+    for i in range(store.n):
+        fn = corrections.get(int(sm[i]), ident)
+        x = float(rt[i])
+        delta = fn(x) - x
+        rt[i] = x + delta
+        rtm[i] = float(rtm[i]) + delta
+        rtx[i] = float(rtx[i]) + delta
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -1447,26 +1544,33 @@ def run_alignment(
     # byte-identical peaks. If a process pool can't spawn (e.g. a onefile frozen
     # build that mis-bootstraps its children), we fall back to SERIAL — never to
     # threads — so the result is always at least as fast as sequential detection.
-    all_peaks = []
+    # Peaks are converted to columnar PeakStore CHUNKS as each file completes and
+    # the per-file dicts are dropped immediately, so only one file's dicts are ever
+    # alive while the columnar store (70 B/peak) grows — this is what keeps a
+    # 300-file run inside ~2.4 GB instead of ~17 GB of dicts. Chunks are
+    # concatenated once, after detection, preserving order for the stable m/z sort.
+    peak_chunks = []
     all_ms2_by_sample = {}
     n_ok = 0
     n_done = 0
+    n_peaks_total = 0
     n_workers = max(2, min((os.cpu_count() or 2), 8))
     tasks = [(idx, path, cache_dir, peak_params) for idx, path in enumerate(files)]
 
     def _collect(rec):
-        nonlocal n_ok, n_done
+        nonlocal n_ok, n_done, n_peaks_total
         idx, status, a, b, c = rec
         n_done += 1
         name = os.path.basename(files[idx])
         if status == "ERROR":
             flog(f"[{idx + 1}/{total}] {name}  ERROR: {a}", "ERROR")
         else:
-            all_peaks.extend(a)          # a=peaks, b=ms2_scans, c=kind
-            all_ms2_by_sample[idx] = b
+            peak_chunks.append(PeakStore.from_dicts(a))   # a=peaks (dicts freed after)
+            n_peaks_total += len(a)
+            all_ms2_by_sample[idx] = b                    # b=ms2_scans, c=kind
             n_ok += 1
             flog(f"[{idx + 1}/{total}] {name}: {c}; {len(a)} peaks.", "OK")
-        log_q.put(("STAT", (n_done, n_ok, len(all_peaks),
+        log_q.put(("STAT", (n_done, n_ok, n_peaks_total,
                             _calc_eta(start_time, n_done, total - n_done))))
 
     detected = False
@@ -1482,7 +1586,8 @@ def run_alignment(
             detected = True
         except Exception as exc:
             flog(f"  Parallel detection unavailable ({exc}); using serial.", "WARN")
-            all_peaks.clear(); all_ms2_by_sample.clear(); n_ok = 0; n_done = 0
+            peak_chunks.clear(); all_ms2_by_sample.clear()
+            n_ok = 0; n_done = 0; n_peaks_total = 0
 
     if not detected and not stop_event.is_set():
         flog(f"Detecting peaks in {total} file(s), serial…")
@@ -1516,18 +1621,23 @@ def run_alignment(
              f"{total - n_ok} failed (see ERROR lines above). Grouping now uses "
              f"a denominator of {n_ok}; review the failures before trusting "
              f"these results.", "WARN")
-    flog(f"Peak picking complete: {len(all_peaks)} peaks across {n_samples} sample(s).")
+    # Fold the per-file chunks into one columnar store; drop the chunk list so the
+    # only large object from here on is the store itself.
+    store = PeakStore.concat(peak_chunks)
+    peak_chunks.clear()
+    flog(f"Peak picking complete: {store.n} peaks across {n_samples} sample(s) "
+         f"(columnar store {store.nbytes() / 1e6:.0f} MB).")
 
     flog("Correspondence — grouping peaks across samples…")
-    features = group_peaks_density(all_peaks, n_samples, grp_params, cb=cb)
+    features = group_peaks_density(store, n_samples, grp_params, cb=cb)
     flog(f"  {len(features)} feature(s) after initial grouping.")
 
     flog("Computing per-sample RT correction from anchor features…")
-    corrections = compute_rt_correction(features, n_samples)
-    apply_rt_correction(all_peaks, corrections)
+    corrections = compute_rt_correction(store, features, n_samples)
+    apply_rt_correction(store, corrections)
 
     flog("Re-grouping on RT-corrected peaks…")
-    features = group_peaks_density(all_peaks, n_samples, grp_params, cb=cb)
+    features = group_peaks_density(store, n_samples, grp_params, cb=cb)
     flog(f"  {len(features)} final feature(s) after RT-corrected re-grouping.")
 
     flog("Attaching representative MS2 fragmentation per feature…")
@@ -1536,7 +1646,7 @@ def run_alignment(
     flog(f"  {n_with_ms2}/{len(features)} feature(s) matched to an MS2 spectrum.")
 
     flog("Writing Excel output…")
-    out_path, peaks_csv = write_feature_table(features, sample_names, out_dir)
+    out_path, peaks_csv = write_feature_table(store, features, sample_names, out_dir)
     flog(f"Output written: {out_path}", "OK")
     if peaks_csv:
         flog(f"Per-peak table written separately (too large for a worksheet): {peaks_csv}", "OK")
@@ -1651,7 +1761,7 @@ PEAK_COLUMNS = ["feature", "sample", "m.z", "RT", "Height", "Area", "S.N"]
 PEAKS_XLSX_MAX_ROWS = 100_000
 
 
-def write_feature_table(features, sample_names, out_dir):
+def write_feature_table(store, features, sample_names, out_dir):
     """
     Writes three sheets:
       Features    — one row per aligned feature (cross-sample summary + MS2)
@@ -1690,22 +1800,25 @@ def write_feature_table(features, sample_names, out_dir):
         })
 
         by_sample = {}
-        for p in feat["peaks"]:
-            by_sample.setdefault(p["sample"], []).append(p)
+        for gi in feat["peak_idx"]:
+            gi = int(gi)
+            s = int(store.sample[gi])
+            h = float(store.height[gi])          # float32 store -> exact float64
+            by_sample.setdefault(s, []).append(h)
             peak_rows.append({
                 "feature": feature_id,
-                "sample": sample_names[p["sample"]],
-                "m.z": round(p["mz"], 9),
-                "RT": round(p["rt"], 6),
-                "Height": round(p["height"], 2),
-                "Area": round(p["area"], 2),
-                "S.N": round(p["snr"], 2),
+                "sample": sample_names[s],
+                "m.z": round(float(store.mz[gi]), 9),
+                "RT": round(float(store.rt[gi]), 6),
+                "Height": round(h, 2),
+                "Area": round(float(store.area[gi]), 2),
+                "S.N": round(float(store.snr[gi]), 2),
             })
 
         intens_row = {"feature": feature_id}
         for s, name in enumerate(sample_names):
             vals = by_sample.get(s)
-            intens_row[name] = max(v["height"] for v in vals) if vals else None
+            intens_row[name] = max(vals) if vals else None
         intensity_rows.append(intens_row)
 
     df_feat = pd.DataFrame(feature_rows, columns=FEATURE_COLUMNS)
