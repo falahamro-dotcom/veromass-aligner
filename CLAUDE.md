@@ -13,8 +13,9 @@ Pure Python — no R runtime dependency, no rpy2.
 `.mzML`, `.mzXML`, `.raw` (Thermo), `.mgf`, and `.zip` archives of any of these
 (extracted recursively — `expand_inputs`, handles nested zips such as a dataset
 zip whose entries are per-sample zips each containing one mzML). The folder
-scanner picks up all of these; `run_alignment` extracts archives first, then
-processes the readable MS files.
+scanner picks up all of these. The **Convert tab** runs `expand_inputs` +
+`convert_raw`; the **Align tab** (with `skip_conversion=True`) skips both and
+goes straight to peak detection on already-converted files.
 
 - **MGF** spectra are ALREADY peak-picked (one precursor per BEGIN/END IONS
   block). There is no MS1 chromatographic axis, so the MGF path skips ROI
@@ -25,6 +26,27 @@ processes the readable MS files.
   ~one-spectrum-per-feature actually chosen for MS2 output). A typical MGF has
   ~240 fragments/spectrum, so eager parsing would convert millions of floats up
   front — lazy parsing cut real 2-file MGF runs from ~9.6s to ~3s.
+
+## Two-tab architecture (Convert | Align)
+
+The app has a **two-tab notebook** — Convert and Align are now separate jobs,
+each with its own thread, queue, and log. See `[[two-tab-architecture-verified]]`.
+
+### Convert tab (Tab 0)
+- **Pipeline**: `scan_input_files` → `expand_inputs` (zip extraction) → `convert_raw` (RAW→mzML, concurrent threads) + copy passthrough MS files into output folder
+- **Output**: self-contained folder of mzML-ready files
+- **Controls**: Start / Stop / Open Output Folder (no Pause/Reset)
+- **Auto-link**: on completion, sets the Align tab's input folder to the conversion output
+
+### Align tab (Tab 1)
+- **Pipeline**: `scan_input_files` → `run_alignment(skip_conversion=True)` → detection → grouping → RT correction → re-grouping → MS2 → export
+- **Input**: mzML/mzXML/mgf files (already converted — no expansion/RAW conversion)
+- **Controls**: Start / Pause / Stop / Reset / Open Output Folder
+- **Parameters**: all 8 fields seeded from `PeakDetectionParams()` / `GroupingParams()` defaults
+
+### Testing
+Run `python VeroMass_Aligner.py`. Test Convert first (with `.raw` or `.zip` files),
+then switch to Align tab (input auto-fills). Both logs are independent per tab.
 
 ## Entry point
 

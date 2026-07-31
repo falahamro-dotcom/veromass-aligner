@@ -70,7 +70,7 @@ from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
 # Constants
 # ═════════════════════════════════════════════════════════════════════════════
 TOOL_NAME     = "VeroMass Aligner"
-VERSION       = "1.10.0"
+VERSION       = "1.11.0"
 OUTPUT_SUBDIR = "VeroMass_Aligner_Output"
 MS_EXTS = (".mzml", ".mzxml", ".raw", ".mgf")   # directly-readable MS files
 ARCHIVE_EXTS = (".zip",)                          # extracted, then scanned for MS_EXTS
@@ -540,19 +540,40 @@ def _mzml_complete(path):
         return False
 
 
-def convert_raw(raw_path, out_dir, cb, custom_trfp=""):
+def _mgf_complete(path):
+    """Cheap integrity check for MGF output: file exists, has a minimum size,
+    and ends with END IONS (the expected closing tag for any valid MGF)."""
+    try:
+        if os.path.getsize(path) < 512:
+            return False
+        with open(path, "rb") as fh:
+            fh.seek(max(0, os.path.getsize(path) - 128))
+            tail = fh.read()
+        return b"END IONS" in tail
+    except OSError:
+        return False
+
+
+def convert_raw(raw_path, out_dir, cb, custom_trfp="", out_format="mzML"):
+    """Convert a Thermo .raw file to the requested *out_format* ("mzML" or
+    "MGF") via ThermoRawFileParser. Returns the path to the output file."""
     raw_path = Path(raw_path)
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    expected = out_dir / (raw_path.stem + ".mzML")
+    fmt_lower = out_format.lower().strip()
+    ext = ".mgf" if fmt_lower == "mgf" else ".mzML"
+    fmt_flag = "1" if fmt_lower == "mgf" else "2"
+    fmt_name = "MGF" if fmt_lower == "mgf" else "mzML"
+    expected = out_dir / (raw_path.stem + ext)
+    complete_fn = _mgf_complete if fmt_lower == "mgf" else _mzml_complete
 
-    # Reuse a cache entry ONLY if it is actually complete. A partial stub left by
-    # an interrupted earlier run must never be trusted just because it exists.
+    # Reuse a cache entry ONLY if it is actually complete. A partial stub left
+    # by an interrupted earlier run must never be trusted just because it exists.
     if expected.exists():
-        if _mzml_complete(expected):
-            cb(f"  Using cached mzML: {expected.name}")
+        if complete_fn(expected):
+            cb(f"  Using cached {fmt_name}: {expected.name}")
             return str(expected)
-        cb(f"  Discarding incomplete cached mzML: {expected.name}")
+        cb(f"  Discarding incomplete cached {fmt_name}: {expected.name}")
         try:
             expected.unlink()
         except OSError:
@@ -561,28 +582,25 @@ def convert_raw(raw_path, out_dir, cb, custom_trfp=""):
     trfp = find_trfp(custom_trfp)
     if not trfp:
         trfp = download_trfp(cb)
-    cb(f"  Converting via ThermoRawFileParser: {raw_path.name}…")
+    cb(f"  Converting via ThermoRawFileParser → {fmt_name}: {raw_path.name}…")
 
     # Convert to a temp file in the same directory, validate, then atomically
     # rename into place (os.replace). A crash or interrupt can then only leave a
-    # *.part.mzML partial (removed below) — never a poisoned `expected` cache
-    # entry. We also address explicitly to `-b=<tmp>` and return `expected`
-    # itself rather than globbing the shared cache dir and taking the
-    # alphabetically-last .mzML (which, with many files in one cache dir, could
-    # hand back a DIFFERENT sample's data).
-    tmp = out_dir / (raw_path.stem + ".part.mzML")
+    # *.part.mzML (or .part.mgf) partial — never a poisoned cache entry.
+    # We address explicitly to `-b=<tmp>` so we know the exact output path.
+    tmp = out_dir / (raw_path.stem + f".part{ext}")
     try:
         tmp.unlink()
     except OSError:
         pass
-    cmd = [trfp, f"-i={raw_path}", f"-b={tmp}", "-f=2", "-m=2"]
+    cmd = [trfp, f"-i={raw_path}", f"-b={tmp}", f"-f={fmt_flag}", "-m=2"]
     ret, out = _run_with_heartbeat(cmd, cb, RAW_CONVERT_TIMEOUT_SEC)
-    if ret != 0 or not tmp.exists() or not _mzml_complete(tmp):
+    if ret != 0 or not tmp.exists() or not complete_fn(tmp):
         try:
             tmp.unlink()
         except OSError:
             pass
-        raise RuntimeError(f"Conversion failed (exit {ret}):\n{out[-300:]}")
+        raise RuntimeError(f"Conversion to {fmt_name} failed (exit {ret}):\n{out[-300:]}")
     os.replace(str(tmp), str(expected))
     return str(expected)
 
@@ -1460,6 +1478,7 @@ def _detect_worker(args):
 def run_alignment(
     files, out_dir, peak_params, grp_params,
     stop_event, pause_event, log_q,
+    skip_conversion=False,
 ):
     """
     Background worker. Sends messages to *log_q*:
@@ -1496,45 +1515,56 @@ def run_alignment(
     flog(f"Output folder : {out_dir}")
     flog("=" * 60)
 
-    # ── Expand any .zip archives (recursively) into readable MS files ─────────
-    n_archives = sum(1 for p in files if p.lower().endswith(ARCHIVE_EXTS))
-    if n_archives:
-        flog(f"Extracting {n_archives} archive(s)…")
-        files = expand_inputs(files, cache_dir, cb)
+    if not skip_conversion:
+        # ── Expand any .zip archives (recursively) into readable MS files ─────────
+        n_archives = sum(1 for p in files if p.lower().endswith(ARCHIVE_EXTS))
+        if n_archives:
+            flog(f"Extracting {n_archives} archive(s)…")
+            files = expand_inputs(files, cache_dir, cb)
+        else:
+            files = [p for p in files if p.lower().endswith(MS_EXTS)]
+
+        total = len(files)
+        if total == 0:
+            flog("No readable MS files found (after extracting any archives).", "WARN")
+            log_q.put(("DONE", None))
+            return
+        flog(f"Total MS files: {total}")
+
+        sample_names = [os.path.basename(p) for p in files]
+
+        # ── Pre-convert RAW files CONCURRENTLY ────────────────────────────────────
+        # RAW->mzML conversion is an external ThermoRawFileParser subprocess (~30s
+        # each) that does NOT hold the Python GIL, so running conversions in
+        # parallel threads turns N sequential conversions into ~one conversion's
+        # wall-time. (Peak detection is left serial below — it's CPU-bound Python
+        # and the GIL makes threads there slower than serial, so parallelizing it
+        # would need processes; the vectorized detector is already ~1s/file.)
+        raw_files = [p for p in files if p.lower().endswith(".raw")]
+        if raw_files and not stop_event.is_set():
+            n_conv = min(len(raw_files), max(2, (os.cpu_count() or 2)), 6)
+            flog(f"Pre-converting {len(raw_files)} RAW file(s), {n_conv} at a time…")
+
+            def _convert_one(path):
+                if stop_event.is_set():
+                    return
+                try:
+                    convert_raw(path, cache_dir, cb)
+                except Exception as exc:
+                    flog(f"  [{os.path.basename(path)}] conversion ERROR: {exc}", "ERROR")
+
+            with ThreadPoolExecutor(max_workers=n_conv) as pool:
+                list(pool.map(_convert_one, raw_files))
     else:
+        # Files are already MS-readable (Align tab — conversion was done separately)
         files = [p for p in files if p.lower().endswith(MS_EXTS)]
-
-    total = len(files)
-    if total == 0:
-        flog("No readable MS files found (after extracting any archives).", "WARN")
-        log_q.put(("DONE", None))
-        return
-    flog(f"Total MS files: {total}")
-
-    sample_names = [os.path.basename(p) for p in files]
-
-    # ── Pre-convert RAW files CONCURRENTLY ────────────────────────────────────
-    # RAW->mzML conversion is an external ThermoRawFileParser subprocess (~30s
-    # each) that does NOT hold the Python GIL, so running conversions in
-    # parallel threads turns N sequential conversions into ~one conversion's
-    # wall-time. (Peak detection is left serial below — it's CPU-bound Python
-    # and the GIL makes threads there slower than serial, so parallelizing it
-    # would need processes; the vectorized detector is already ~1s/file.)
-    raw_files = [p for p in files if p.lower().endswith(".raw")]
-    if raw_files and not stop_event.is_set():
-        n_conv = min(len(raw_files), max(2, (os.cpu_count() or 2)), 6)
-        flog(f"Pre-converting {len(raw_files)} RAW file(s), {n_conv} at a time…")
-
-        def _convert_one(path):
-            if stop_event.is_set():
-                return
-            try:
-                convert_raw(path, cache_dir, cb)
-            except Exception as exc:
-                flog(f"  [{os.path.basename(path)}] conversion ERROR: {exc}", "ERROR")
-
-        with ThreadPoolExecutor(max_workers=n_conv) as pool:
-            list(pool.map(_convert_one, raw_files))
+        total = len(files)
+        if total == 0:
+            flog("No readable MS files found.", "WARN")
+            log_q.put(("DONE", None))
+            return
+        flog(f"Total MS files: {total}")
+        sample_names = [os.path.basename(p) for p in files]
 
     # ── Peak detection: PROCESS POOL across files, with a serial fallback ─────
     # Each file is independent. Detection is dominated by mzML PARSING, which is
@@ -1749,6 +1779,122 @@ def extract_peaks_and_ms2(path, cache_dir, peak_params, cb=None):
 
 
 # ═════════════════════════════════════════════════════════════════════════════
+# CONVERSION ONLY  — run_conversion for the Convert tab
+# ═════════════════════════════════════════════════════════════════════════════
+def run_conversion(
+    files, out_dir, stop_event, log_q,
+    out_format="mzML",
+):
+    """
+    Background worker for the Convert tab. Expands zip archives into *out_dir*
+    and converts RAW files to the requested format (``out_format``: ``"mzML"``,
+    ``"MGF"``, or ``"Both"`` for both) concurrently via ThreadPoolExecutor.
+    Non-RAW MS files (mzML/mzXML/mgf) are copied into *out_dir* so the output
+    is a self-contained folder of MS-ready files for the Align tab.
+
+    Uses the same log_q protocol as run_alignment:
+      ("LOG",  (level, msg))
+      ("STAT", (idx, done, features, eta))
+      ("DONE", None)
+    """
+    log_path = os.path.join(out_dir, "conversion_log.txt")
+    start_time = time.time()
+    log_lock = threading.Lock()
+
+    def flog(msg, level="INFO"):
+        ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        log_q.put(("LOG", (level, msg)))
+        with log_lock:
+            with open(log_path, "a", encoding="utf-8") as fh:
+                fh.write(f"[{ts}] [{level}] {msg}\n")
+
+    def cb(msg, level="INFO"):
+        flog(msg, level)
+
+    flog("=" * 60)
+    flog(f"{TOOL_NAME} v{VERSION} — Conversion started")
+    flog(f"Output folder : {out_dir}")
+    flog("=" * 60)
+
+    # ── Expand archives ──
+    n_archives = sum(1 for p in files if p.lower().endswith(ARCHIVE_EXTS))
+    if n_archives:
+        flog(f"Extracting {n_archives} archive(s) into output folder…")
+        files = expand_inputs(files, out_dir, cb)
+    else:
+        files = [p for p in files if p.lower().endswith(MS_EXTS)]
+
+    total = len(files)
+    if total == 0:
+        flog("No readable MS files found (after extracting any archives).", "WARN")
+        log_q.put(("DONE", None))
+        return
+    flog(f"Total MS files to process: {total}")
+
+    raw_files = [p for p in files if p.lower().endswith(".raw")]
+    passthrough_files = [p for p in files if not p.lower().endswith(".raw")]
+    n_total = len(raw_files) + len(passthrough_files)
+    n_done = 0
+    n_ok = 0
+
+    # ── Copy passthrough files (mzML/mzXML/mgf) to output folder ──
+    if passthrough_files and not stop_event.is_set():
+        flog(f"Copying {len(passthrough_files)} non-RAW MS file(s) to output folder…")
+        for p in passthrough_files:
+            if stop_event.is_set():
+                break
+            dest = os.path.join(out_dir, os.path.basename(p))
+            if os.path.abspath(p) == os.path.abspath(dest):
+                n_done += 1
+                continue
+            try:
+                shutil.copy2(p, dest)
+                n_done += 1
+                n_ok += 1
+                flog(f"  Copied {os.path.basename(p)}")
+            except Exception as exc:
+                n_done += 1
+                flog(f"  Could not copy {os.path.basename(p)}: {exc}", "WARN")
+            log_q.put(("STAT", (n_done, n_ok, 0,
+                                _calc_eta(start_time, n_done, n_total - n_done))))
+
+    # ── Convert RAW files CONCURRENTLY ──
+    if raw_files and not stop_event.is_set():
+        n_conv = min(len(raw_files), max(2, (os.cpu_count() or 2)), 6)
+        fmt_label = out_format if out_format.lower() != "both" else "mzML and MGF"
+        flog(f"Converting {len(raw_files)} RAW file(s) to {fmt_label}, {n_conv} at a time…")
+
+        def _convert_one(path):
+            nonlocal n_done, n_ok
+            if stop_event.is_set():
+                return
+            name = os.path.basename(path)
+            try:
+                if out_format.lower() == "both":
+                    # Produce both formats: mzML for alignment, MGF for libraries
+                    convert_raw(path, out_dir, cb, out_format="mzML")
+                    convert_raw(path, out_dir, cb, out_format="MGF")
+                else:
+                    convert_raw(path, out_dir, cb, out_format=out_format)
+                n_ok += 1
+            except Exception as exc:
+                flog(f"  [{name}] conversion ERROR: {exc}", "ERROR")
+            n_done += 1
+            log_q.put(("STAT", (n_done, n_ok, 0,
+                                _calc_eta(start_time, n_done, n_total - n_done))))
+
+        with ThreadPoolExecutor(max_workers=n_conv) as pool:
+            list(pool.map(_convert_one, raw_files))
+
+        if n_ok:
+            flog(f"Converted {n_ok}/{len(raw_files)} RAW file(s) to {fmt_label}.", "OK")
+
+    flog("=" * 60 + "\nConversion finished.", "OK")
+    log_q.put(("STAT", (n_total, n_ok, 0, "—")))
+    log_q.put(("DONE", None))
+
+
+# ═════════════════════════════════════════════════════════════════════════════
 # CONFIDENCE  — a soft per-feature quality score (does NOT drop any feature)
 # ═════════════════════════════════════════════════════════════════════════════
 def _pctrank(x):
@@ -1912,85 +2058,89 @@ def write_feature_table(store, features, sample_names, out_dir):
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# GUI
+# GUI  —  two-tab notebook: Convert tab + Align tab
 # ═════════════════════════════════════════════════════════════════════════════
-class App(tk.Tk):
-    def __init__(self):
-        super().__init__()
-        # When launched via "Process locally" (veromass-bridge/launcher.py),
-        # these env vars carry the Workbench/Job name AND id the scientist
-        # already sees in app.veromass.com — shown here so the desktop run
-        # is visibly the same job, not just silently linked by a UUID the
-        # commit path already guarantees underneath. Unset on a normal
-        # manual launch (`python VeroMass_Aligner.py`) — title/UI are then
-        # unchanged from before.
-        self._linked_workbench_name = os.environ.get("VEROMASS_WORKBENCH_NAME") or None
-        self._linked_job_name = os.environ.get("VEROMASS_JOB_NAME") or None
-        self._linked_job_id = os.environ.get("VEROMASS_JOB_ID") or None
 
-        title = f"{TOOL_NAME}  v{VERSION}"
-        if self._linked_job_name or self._linked_workbench_name:
-            title += f"  —  {self._linked_workbench_name or '?'} / {self._linked_job_name or '(untitled job)'}"
-        self.title(title)
-        # A fixed "1000x780" put the bottom button bar (Start/Pause/
-        # Reset/Open Output Folder) off-screen on smaller/lower-resolution
-        # displays — the window simply extended past the visible desktop
-        # area (behind the taskbar or off the bottom edge entirely), and a
-        # user had to manually drag-resize or maximize to ever see those
-        # buttons. Size relative to the REAL screen instead, capped at the
-        # old 1000x780 on large displays, and center it — the whole window
-        # (buttons included) is now always inside the visible screen at
-        # launch, on any display, with zero manual resizing needed.
-        screen_w, screen_h = self.winfo_screenwidth(), self.winfo_screenheight()
-        win_w = min(1000, int(screen_w * 0.92))
-        win_h = min(780, int(screen_h * 0.88))
-        x, y = (screen_w - win_w) // 2, (screen_h - win_h) // 2
-        self.geometry(f"{win_w}x{win_h}+{x}+{y}")
-        self.minsize(min(860, win_w), min(640, win_h))
-        self.configure(bg=C_BG)
+class JobFrame(tk.Frame):
+    """Shared base for Convert and Align tab frames. Provides widget helpers,
+    logging, queue-polling, and threading infrastructure."""
 
+    def __init__(self, parent, app):
+        super().__init__(parent, bg=C_BG)
+        self._app = app
         self._stop_ev = threading.Event()
-        self._pause_ev = threading.Event()
-        self._pause_ev.set()
-        self._log_q = queue.Queue()
         self._thread = None
+        self._log_q = queue.Queue()
         self._total = 0
 
+    # ── Widget helpers ────────────────────────────────────────────────────────
+    def _section(self, title):
+        return tk.LabelFrame(self, text=title, bg=C_BG, fg=C_TEAL, font=("Segoe UI", 9, "bold"),
+                              bd=1, relief="groove", highlightbackground=C_BORDER)
+
+    def _path_row(self, parent, label, var, cmd):
+        row = tk.Frame(parent, bg=C_BG)
+        row.pack(fill="x", padx=12, pady=(6, 2))
+        tk.Label(row, text=label, bg=C_BG, fg=C_FG, width=15, font=("Segoe UI", 9), anchor="w").pack(side="left")
+        tk.Entry(row, textvariable=var, bg=C_PANEL, fg=C_FG, insertbackground=C_FG,
+                  relief="flat", bd=4, font=("Consolas", 9)).pack(side="left", fill="x", expand=True, padx=(0, 8))
+        tk.Button(row, text="Browse…", bg=C_BORDER, fg=C_FG, relief="flat", padx=10,
+                  cursor="hand2", command=cmd).pack(side="left")
+
+    def _chk(self, parent, text, var, padx=(0, 0)):
+        tk.Checkbutton(parent, text=text, variable=var, bg=C_BG, fg=C_FG, selectcolor=C_PANEL,
+                        activebackground=C_BG, activeforeground=C_TEAL, font=("Segoe UI", 9)).pack(side="left", padx=padx)
+
+    def _stat_card(self, parent, label, value, color):
+        frame = tk.Frame(parent, bg=C_PANEL, bd=0)
+        frame.pack(side="left", padx=6, ipadx=14, ipady=8)
+        lbl = tk.Label(frame, text=value, bg=C_PANEL, fg=color, font=("Segoe UI", 20, "bold"))
+        lbl.pack()
+        tk.Label(frame, text=label, bg=C_PANEL, fg=C_DIM, font=("Segoe UI", 8)).pack()
+        return lbl
+
+    def _btn(self, parent, text, bg, fg, cmd, state="normal", bold=False):
+        return tk.Button(parent, text=text, bg=bg, fg=fg, font=("Segoe UI", 9, "bold" if bold else "normal"),
+                          relief="flat", padx=16, pady=6, cursor="hand2", command=cmd, state=state)
+
+    def _log(self, level, msg):
+        ts = datetime.datetime.now().strftime("%H:%M:%S")
+        tag = level if level in ("INFO", "OK", "WARN", "ERROR") else "INFO"
+        self._log_w.configure(state="normal")
+        self._log_w.insert("end", f"[{ts}] {msg}\n", tag)
+        self._log_w.configure(state="disabled")
+        self._log_w.see("end")
+
+    def _poll(self):
+        try:
+            while True:
+                msg_type, payload = self._log_q.get_nowait()
+                self._handle_msg(msg_type, payload)
+        except queue.Empty:
+            pass
+
+    def _handle_msg(self, msg_type, payload):
+        """Override in subclass for tab-specific message dispatch."""
+        pass
+
+
+# ── Convert tab ─────────────────────────────────────────────────────────────
+class ConvertFrame(JobFrame):
+    """Tab 0: Convert RAW files and expand archives into a folder of mzML files
+    ready for the Align tab."""
+
+    def __init__(self, parent, app):
+        super().__init__(parent, app)
+        self._align_frame = None  # set by App after both tabs exist
         self._build_ui()
-        if os.environ.get("VEROMASS_OUTPUT_DIR"):
-            self._log("INFO", f"Output folder auto-set for Bridge pickup: {self._outfolder_var.get()}")
-        self.after(150, self._poll)
 
-    # ── UI construction ───────────────────────────────────────────────────────
     def _build_ui(self):
-        tf = tk.Frame(self, bg=C_BG)
-        tf.pack(fill="x", padx=24, pady=(18, 2))
-        tk.Label(tf, text=TOOL_NAME, bg=C_BG, fg=C_TEAL,
-                 font=("Segoe UI", 17, "bold")).pack(side="left")
-        tk.Label(tf, text=f" v{VERSION}  ·  VeroMass / MoleculeID Platform  ·  Standalone Utility",
-                 bg=C_BG, fg=C_DIM, font=("Segoe UI", 9)).pack(side="left", padx=8)
-
-        if self._linked_job_name or self._linked_workbench_name:
-            short_id = f"…{self._linked_job_id[-8:]}" if self._linked_job_id else ""
-            tk.Label(
-                tf,
-                text=f"  Linked to: {self._linked_workbench_name or '?'} → "
-                     f"{self._linked_job_name or '(untitled job)'} ({short_id})",
-                bg=C_BG, fg=C_TEAL, font=("Segoe UI", 9, "bold"),
-            ).pack(side="left", padx=(12, 0))
-
         # ── Input ──
         inp = self._section("  Input  ")
         inp.pack(fill="x", padx=20, pady=(8, 0))
 
         self._folder_var = tk.StringVar()
-        # When launched via "Process locally", veromass-bridge sets
-        # VEROMASS_OUTPUT_DIR to a per-job subfolder of its own watched
-        # folder (watch.py's DEFAULT_DIR) — pre-filling it here means the
-        # scientist never has to know/type that path for the Bridge to
-        # auto-pick-up the finished run. A manual launch (env var unset)
-        # is unchanged — empty, same as before.
-        self._outfolder_var = tk.StringVar(value=os.environ.get("VEROMASS_OUTPUT_DIR", ""))
+        self._outfolder_var = tk.StringVar()
         self._recurse_var = tk.BooleanVar(value=True)
 
         self._path_row(inp, "Runs folder:", self._folder_var, self._browse_in)
@@ -2000,6 +2150,185 @@ class App(tk.Tk):
         opt.pack(fill="x", padx=12, pady=(4, 10))
         self._chk(opt, "Scan subfolders recursively", self._recurse_var)
         tk.Label(opt, text="  Accepts: .mzML  .mzXML  .raw (Thermo)  .mgf  .zip",
+                 bg=C_BG, fg=C_DIM, font=("Segoe UI", 8)).pack(side="left", padx=(20, 0))
+
+        # ── Output format ──
+        fmt_f = tk.Frame(inp, bg=C_BG)
+        fmt_f.pack(fill="x", padx=12, pady=(0, 10))
+        tk.Label(fmt_f, text="RAW output format:", bg=C_BG, fg=C_FG,
+                 font=("Segoe UI", 9)).pack(side="left", padx=(0, 8))
+        self._format_var = tk.StringVar(value="mzML")
+        fmt_cb = ttk.Combobox(fmt_f, textvariable=self._format_var, values=["mzML", "MGF", "Both"],
+                               state="readonly", width=8, font=("Consolas", 9))
+        fmt_cb.pack(side="left")
+        tk.Label(fmt_f, text="  mzML for alignment  ·  MGF for spectral library  ·  Both = mzML + MGF",
+                 bg=C_BG, fg=C_DIM, font=("Segoe UI", 8)).pack(side="left", padx=(12, 0))
+
+        # ── Progress ──
+        prg = self._section("  Progress  ")
+        prg.pack(fill="x", padx=20, pady=(8, 0))
+
+        cards = tk.Frame(prg, bg=C_BG)
+        cards.pack(fill="x", padx=12, pady=(10, 4))
+        self._sv_processed = self._stat_card(cards, "Files done", "0", C_TEAL)
+        self._sv_total = self._stat_card(cards, "Total files", "0", C_FG)
+        self._sv_peaks = self._stat_card(cards, "Converted", "0", C_PURP)
+        self._sv_eta = self._stat_card(cards, "ETA", "—", C_GREEN)
+
+        pb_f = tk.Frame(prg, bg=C_BG)
+        pb_f.pack(fill="x", padx=12, pady=(4, 2))
+        sty = ttk.Style()
+        sty.theme_use("clam")
+        sty.configure("T.Horizontal.TProgressbar", troughcolor=C_PANEL, background=C_TEAL,
+                       darkcolor=C_TEAL, lightcolor=C_TEAL, bordercolor=C_PANEL)
+        self._pb = ttk.Progressbar(pb_f, orient="horizontal", length=100,
+                                    mode="determinate", style="T.Horizontal.TProgressbar")
+        self._pb.pack(fill="x", expand=True)
+        self._pb_lbl = tk.Label(pb_f, text="0 / 0  (0%)", bg=C_BG, fg=C_SUB, font=("Segoe UI", 8))
+        self._pb_lbl.pack(pady=(2, 6))
+
+        # ── Buttons ──
+        btn_f = tk.Frame(self, bg=C_BG)
+        btn_f.pack(side="bottom", fill="x", padx=20, pady=12)
+        self._btn_start = self._btn(btn_f, "▶  Start", bg=C_TEAL, fg="#000000", bold=True, cmd=self._start)
+        self._btn_start.pack(side="left", padx=(0, 8))
+        self._btn_stop = self._btn(btn_f, "⏹  Stop", bg="#2A1520", fg=C_RED, cmd=self._stop, state="disabled")
+        self._btn_stop.pack(side="left")
+        self._btn_open = self._btn(btn_f, "\U0001F4C2  Open Output Folder", bg=C_BORDER, fg=C_FG, cmd=self._open_out)
+        self._btn_open.pack(side="right")
+
+        # ── Log ──
+        log_sec = self._section("  Conversion Log  ")
+        log_sec.pack(fill="both", expand=True, padx=20, pady=(8, 0))
+        self._log_w = scrolledtext.ScrolledText(
+            log_sec, bg="#080E1A", fg=C_SUB, font=("Consolas", 8),
+            relief="flat", state="disabled", wrap="word",
+        )
+        self._log_w.pack(fill="both", expand=True, padx=6, pady=6)
+        for tag, col in (("INFO", C_SUB), ("OK", C_TEAL), ("WARN", C_AMB), ("ERROR", C_RED)):
+            self._log_w.tag_config(tag, foreground=col)
+
+    # ── Browse callbacks ──────────────────────────────────────────────────────
+    def _browse_in(self):
+        d = filedialog.askdirectory(title="Select folder containing RAW / mzML / mzXML / MGF / ZIP files")
+        if d:
+            self._folder_var.set(d)
+            if not self._outfolder_var.get():
+                self._outfolder_var.set(os.path.join(d, OUTPUT_SUBDIR + "_converted"))
+
+    def _browse_out(self):
+        d = filedialog.askdirectory(title="Select output folder for converted files")
+        if d:
+            self._outfolder_var.set(d)
+
+    def _open_out(self):
+        p = self._outfolder_var.get()
+        if p and os.path.isdir(p):
+            os.startfile(p)
+        else:
+            self._log("WARN", "Output folder does not exist yet.")
+
+    # ── Start / Stop ──────────────────────────────────────────────────────────
+    def _start(self):
+        folder = self._folder_var.get().strip()
+        out_dir = self._outfolder_var.get().strip()
+        out_format = self._format_var.get().strip()
+
+        if not folder or not os.path.isdir(folder):
+            self._log("ERROR", "Please select a valid runs folder.")
+            return
+        if not out_dir:
+            out_dir = os.path.join(folder, OUTPUT_SUBDIR + "_converted")
+            self._outfolder_var.set(out_dir)
+        os.makedirs(out_dir, exist_ok=True)
+
+        files = scan_input_files(folder, self._recurse_var.get())
+        if not files:
+            self._log("WARN", "No mzML/mzXML/RAW/MGF/ZIP files found.")
+            return
+
+        self._total = len(files)
+        for sv, val in ((self._sv_processed, "0"), (self._sv_total, str(self._total)),
+                         (self._sv_peaks, "0"), (self._sv_eta, "—")):
+            sv["text"] = val
+        self._pb["value"] = 0
+        self._pb_lbl["text"] = f"0 / {self._total}  (0%)"
+
+        self._stop_ev.clear()
+        self._btn_start["state"] = "disabled"
+        self._btn_stop["state"] = "normal"
+
+        self._log("INFO", f"Queued {self._total} file(s).  Output -> {out_dir}")
+
+        self._thread = threading.Thread(
+            target=run_conversion,
+            args=(files, out_dir, self._stop_ev, self._log_q),
+            kwargs={"out_format": out_format},
+            daemon=True,
+        )
+        self._thread.start()
+
+    def _stop(self):
+        self._stop_ev.set()
+        self._log("WARN", "Stop requested — finishing current file…")
+
+    # ── Queue message handling ────────────────────────────────────────────────
+    def _handle_msg(self, msg_type, payload):
+        if msg_type == "LOG":
+            self._log(*payload)
+        elif msg_type == "STAT":
+            idx, done, peaks, eta = payload
+            # Update total if archive expansion produced more files
+            if idx > self._total:
+                self._total = idx
+            pct = int(idx / max(self._total, 1) * 100)
+            self._pb["value"] = pct
+            self._pb_lbl["text"] = f"{idx} / {self._total}  ({pct}%)"
+            self._sv_processed["text"] = str(done)
+            self._sv_peaks["text"] = f"{peaks:,}"
+            self._sv_eta["text"] = eta
+        elif msg_type == "DONE":
+            self._pb["value"] = 100
+            self._btn_start["state"] = "normal"
+            self._btn_stop["state"] = "disabled"
+            # Auto-link: set Align tab's input folder to this output folder
+            if self._align_frame is not None:
+                align_in = self._outfolder_var.get().strip()
+                if align_in and os.path.isdir(align_in):
+                    self._align_frame._folder_var.set(align_in)
+                    if not self._align_frame._outfolder_var.get():
+                        default_align_out = os.path.join(align_in, OUTPUT_SUBDIR)
+                        self._align_frame._outfolder_var.set(default_align_out)
+                    self._log("OK", f"Aligned-input auto-set to: {align_in}")
+
+
+# ── Align tab ───────────────────────────────────────────────────────────────
+class AlignFrame(JobFrame):
+    """Tab 1: Align MS files — peak detection, correspondence grouping,
+    RT correction, re-grouping, MS2 attachment, and Excel export."""
+
+    def __init__(self, parent, app):
+        super().__init__(parent, app)
+        self._pause_ev = threading.Event()
+        self._pause_ev.set()
+        self._build_ui()
+
+    def _build_ui(self):
+        # ── Input ──
+        inp = self._section("  Input  ")
+        inp.pack(fill="x", padx=20, pady=(8, 0))
+
+        self._folder_var = tk.StringVar()
+        self._outfolder_var = tk.StringVar(value=os.environ.get("VEROMASS_OUTPUT_DIR", ""))
+        self._recurse_var = tk.BooleanVar(value=True)
+
+        self._path_row(inp, "MS files folder:", self._folder_var, self._browse_in)
+        self._path_row(inp, "Output folder:", self._outfolder_var, self._browse_out)
+
+        opt = tk.Frame(inp, bg=C_BG)
+        opt.pack(fill="x", padx=12, pady=(4, 10))
+        self._chk(opt, "Scan subfolders recursively", self._recurse_var)
+        tk.Label(opt, text="  Accepts: .mzML  .mzXML  .mgf",
                  bg=C_BG, fg=C_DIM, font=("Segoe UI", 8)).pack(side="left", padx=(20, 0))
 
         # ── Parameters ──
@@ -2056,27 +2385,13 @@ class App(tk.Tk):
         pb_f = tk.Frame(prg, bg=C_BG)
         pb_f.pack(fill="x", padx=12, pady=(4, 2))
         sty = ttk.Style()
-        sty.theme_use("clam")
-        sty.configure("T.Horizontal.TProgressbar", troughcolor=C_PANEL, background=C_TEAL,
-                       darkcolor=C_TEAL, lightcolor=C_TEAL, bordercolor=C_PANEL)
         self._pb = ttk.Progressbar(pb_f, orient="horizontal", length=100,
                                     mode="determinate", style="T.Horizontal.TProgressbar")
         self._pb.pack(fill="x", expand=True)
         self._pb_lbl = tk.Label(pb_f, text="0 / 0  (0%)", bg=C_BG, fg=C_SUB, font=("Segoe UI", 8))
         self._pb_lbl.pack(pady=(2, 6))
 
-        # ── Buttons ── packed BEFORE the Log section, anchored to the
-        # window's bottom edge (side="bottom"). Tkinter's pack manager
-        # allocates space to already-packed widgets first; the Log section
-        # below has fill="both"/expand=True, which — when packed FIRST, as
-        # it used to be — claims all available space at layout time and
-        # pushes whatever is packed after it (this button row) out of the
-        # visible window entirely on any display too short to fit
-        # everything at full size. Packing the buttons first (and anchoring
-        # them to the bottom rather than relying on top-down stacking order
-        # alone) guarantees they always get their own space; Log then only
-        # ever fills whatever room is actually left over, shrinking or
-        # scrolling instead of hiding the controls.
+        # ── Buttons ──
         btn_f = tk.Frame(self, bg=C_BG)
         btn_f.pack(side="bottom", fill="x", padx=20, pady=12)
         self._btn_start = self._btn(btn_f, "▶  Start", bg=C_TEAL, fg="#000000", bold=True, cmd=self._start)
@@ -2091,7 +2406,7 @@ class App(tk.Tk):
         self._btn_open.pack(side="right")
 
         # ── Log ──
-        log_sec = self._section("  Log  ")
+        log_sec = self._section("  Alignment Log  ")
         log_sec.pack(fill="both", expand=True, padx=20, pady=(8, 0))
         self._log_w = scrolledtext.ScrolledText(
             log_sec, bg="#080E1A", fg=C_SUB, font=("Consolas", 8),
@@ -2101,46 +2416,16 @@ class App(tk.Tk):
         for tag, col in (("INFO", C_SUB), ("OK", C_TEAL), ("WARN", C_AMB), ("ERROR", C_RED)):
             self._log_w.tag_config(tag, foreground=col)
 
-    # ── Widget helpers ────────────────────────────────────────────────────────
-    def _section(self, title):
-        return tk.LabelFrame(self, text=title, bg=C_BG, fg=C_TEAL, font=("Segoe UI", 9, "bold"),
-                              bd=1, relief="groove", highlightbackground=C_BORDER)
-
-    def _path_row(self, parent, label, var, cmd):
-        row = tk.Frame(parent, bg=C_BG)
-        row.pack(fill="x", padx=12, pady=(6, 2))
-        tk.Label(row, text=label, bg=C_BG, fg=C_FG, width=15, font=("Segoe UI", 9), anchor="w").pack(side="left")
-        tk.Entry(row, textvariable=var, bg=C_PANEL, fg=C_FG, insertbackground=C_FG,
-                  relief="flat", bd=4, font=("Consolas", 9)).pack(side="left", fill="x", expand=True, padx=(0, 8))
-        tk.Button(row, text="Browse…", bg=C_BORDER, fg=C_FG, relief="flat", padx=10,
-                  cursor="hand2", command=cmd).pack(side="left")
-
-    def _chk(self, parent, text, var, padx=(0, 0)):
-        tk.Checkbutton(parent, text=text, variable=var, bg=C_BG, fg=C_FG, selectcolor=C_PANEL,
-                        activebackground=C_BG, activeforeground=C_TEAL, font=("Segoe UI", 9)).pack(side="left", padx=padx)
-
-    def _stat_card(self, parent, label, value, color):
-        frame = tk.Frame(parent, bg=C_PANEL, bd=0)
-        frame.pack(side="left", padx=6, ipadx=14, ipady=8)
-        lbl = tk.Label(frame, text=value, bg=C_PANEL, fg=color, font=("Segoe UI", 20, "bold"))
-        lbl.pack()
-        tk.Label(frame, text=label, bg=C_PANEL, fg=C_DIM, font=("Segoe UI", 8)).pack()
-        return lbl
-
-    def _btn(self, parent, text, bg, fg, cmd, state="normal", bold=False):
-        return tk.Button(parent, text=text, bg=bg, fg=fg, font=("Segoe UI", 9, "bold" if bold else "normal"),
-                          relief="flat", padx=16, pady=6, cursor="hand2", command=cmd, state=state)
-
     # ── Browse callbacks ──────────────────────────────────────────────────────
     def _browse_in(self):
-        d = filedialog.askdirectory(title="Select folder containing mzML / mzXML / RAW / MGF / ZIP files")
+        d = filedialog.askdirectory(title="Select folder containing mzML / mzXML / MGF files")
         if d:
             self._folder_var.set(d)
             if not self._outfolder_var.get():
                 self._outfolder_var.set(os.path.join(d, OUTPUT_SUBDIR))
 
     def _browse_out(self):
-        d = filedialog.askdirectory(title="Select output folder")
+        d = filedialog.askdirectory(title="Select output folder for alignment results")
         if d:
             self._outfolder_var.set(d)
 
@@ -2151,13 +2436,13 @@ class App(tk.Tk):
         else:
             self._log("WARN", "Output folder does not exist yet.")
 
-    # ── Start / Pause / Stop ──────────────────────────────────────────────────
+    # ── Start / Pause / Stop / Reset ──────────────────────────────────────────
     def _start(self):
         folder = self._folder_var.get().strip()
         out_dir = self._outfolder_var.get().strip()
 
         if not folder or not os.path.isdir(folder):
-            self._log("ERROR", "Please select a valid runs folder.")
+            self._log("ERROR", "Please select a valid MS files folder.")
             return
         if not out_dir:
             out_dir = os.path.join(folder, OUTPUT_SUBDIR)
@@ -2166,7 +2451,7 @@ class App(tk.Tk):
 
         files = scan_input_files(folder, self._recurse_var.get())
         if not files:
-            self._log("WARN", "No mzML/mzXML/RAW/MGF/ZIP files found.")
+            self._log("WARN", "No mzML/mzXML/MGF files found.")
             return
 
         try:
@@ -2205,6 +2490,7 @@ class App(tk.Tk):
             target=run_alignment,
             args=(files, out_dir, peak_params, grp_params,
                   self._stop_ev, self._pause_ev, self._log_q),
+            kwargs={"skip_conversion": True},
             daemon=True,
         )
         self._thread.start()
@@ -2225,12 +2511,6 @@ class App(tk.Tk):
         self._log("WARN", "Stop requested — finishing current file…")
 
     def _reset(self):
-        """Wipe out the CURRENT job's in-progress/finished state — log,
-        progress bars, stat cards, and the run thread — so a fresh run can
-        start clean. Does NOT touch the chosen runs/output folder paths,
-        parameter fields, any file already written to disk, or anything
-        outside this one GUI's own in-memory state (no other job, workbench,
-        or committed cloud result is reachable from here)."""
         if self._thread is not None and self._thread.is_alive():
             if not messagebox.askyesno(
                 "Reset current job",
@@ -2275,38 +2555,106 @@ class App(tk.Tk):
 
         self._log("INFO", "Job reset. Ready for a new run.")
 
-    # ── Queue polling ─────────────────────────────────────────────────────────
-    def _poll(self):
-        try:
-            while True:
-                msg_type, payload = self._log_q.get_nowait()
-                if msg_type == "LOG":
-                    self._log(*payload)
-                elif msg_type == "STAT":
-                    idx, done, peaks, eta = payload
-                    pct = int(idx / max(self._total, 1) * 100)
-                    self._pb["value"] = pct
-                    self._pb_lbl["text"] = f"{idx} / {self._total}  ({pct}%)"
-                    self._sv_processed["text"] = str(done)
-                    self._sv_peaks["text"] = f"{peaks:,}"
-                    self._sv_eta["text"] = eta
-                elif msg_type == "DONE":
-                    self._pb["value"] = 100
-                    self._btn_start["state"] = "normal"
-                    self._btn_pause["state"] = "disabled"
-                    self._btn_stop["state"] = "disabled"
-                    self._btn_pause["text"] = "⏸  Pause"
-        except queue.Empty:
-            pass
-        self.after(150, self._poll)
+    # ── Queue message handling ────────────────────────────────────────────────
+    def _handle_msg(self, msg_type, payload):
+        if msg_type == "LOG":
+            self._log(*payload)
+        elif msg_type == "STAT":
+            idx, done, peaks, eta = payload
+            pct = int(idx / max(self._total, 1) * 100)
+            self._pb["value"] = pct
+            self._pb_lbl["text"] = f"{idx} / {self._total}  ({pct}%)"
+            self._sv_processed["text"] = str(done)
+            self._sv_peaks["text"] = f"{peaks:,}"
+            self._sv_eta["text"] = eta
+        elif msg_type == "DONE":
+            self._pb["value"] = 100
+            self._btn_start["state"] = "normal"
+            self._btn_pause["state"] = "disabled"
+            self._btn_stop["state"] = "disabled"
+            self._btn_pause["text"] = "⏸  Pause"
 
-    def _log(self, level, msg):
-        ts = datetime.datetime.now().strftime("%H:%M:%S")
-        tag = level if level in ("INFO", "OK", "WARN", "ERROR") else "INFO"
-        self._log_w.configure(state="normal")
-        self._log_w.insert("end", f"[{ts}] {msg}\n", tag)
-        self._log_w.configure(state="disabled")
-        self._log_w.see("end")
+
+# ── Main application window ─────────────────────────────────────────────────
+class App(tk.Tk):
+    """Root window with a two-tab notebook: Convert | Align."""
+
+    def __init__(self):
+        super().__init__()
+        # When launched via "Process locally" (veromass-bridge/launcher.py),
+        # these env vars carry the Workbench/Job name AND id the scientist
+        # already sees in app.veromass.com — shown here so the desktop run
+        # is visibly the same job, not just silently linked by a UUID the
+        # commit path already guarantees underneath. Unset on a normal
+        # manual launch (`python VeroMass_Aligner.py`) — title/UI are then
+        # unchanged from before.
+        self._linked_workbench_name = os.environ.get("VEROMASS_WORKBENCH_NAME") or None
+        self._linked_job_name = os.environ.get("VEROMASS_JOB_NAME") or None
+        self._linked_job_id = os.environ.get("VEROMASS_JOB_ID") or None
+
+        title = f"{TOOL_NAME}  v{VERSION}"
+        if self._linked_job_name or self._linked_workbench_name:
+            title += f"  —  {self._linked_workbench_name or '?'} / {self._linked_job_name or '(untitled job)'}"
+        self.title(title)
+        # Size relative to the REAL screen, capped at 1000×780 on large
+        # displays, and centered — the whole window is always inside the
+        # visible screen at launch, on any display, with zero manual resizing.
+        screen_w, screen_h = self.winfo_screenwidth(), self.winfo_screenheight()
+        win_w = min(1000, int(screen_w * 0.92))
+        win_h = min(780, int(screen_h * 0.88))
+        x, y = (screen_w - win_w) // 2, (screen_h - win_h) // 2
+        self.geometry(f"{win_w}x{win_h}+{x}+{y}")
+        self.minsize(min(860, win_w), min(640, win_h))
+        self.configure(bg=C_BG)
+
+        # ── Title header ──
+        tf = tk.Frame(self, bg=C_BG)
+        tf.pack(fill="x", padx=24, pady=(18, 2))
+        tk.Label(tf, text=TOOL_NAME, bg=C_BG, fg=C_TEAL,
+                 font=("Segoe UI", 17, "bold")).pack(side="left")
+        tk.Label(tf, text=f" v{VERSION}  ·  VeroMass / MoleculeID Platform  ·  Standalone Utility",
+                 bg=C_BG, fg=C_DIM, font=("Segoe UI", 9)).pack(side="left", padx=8)
+
+        if self._linked_job_name or self._linked_workbench_name:
+            short_id = f"…{self._linked_job_id[-8:]}" if self._linked_job_id else ""
+            tk.Label(
+                tf,
+                text=f"  Linked to: {self._linked_workbench_name or '?'} → "
+                     f"{self._linked_job_name or '(untitled job)'} ({short_id})",
+                bg=C_BG, fg=C_TEAL, font=("Segoe UI", 9, "bold"),
+            ).pack(side="left", padx=(12, 0))
+
+        # ═══ Notebook: two-tab interface ═══
+        # Dark-theme the notebook via ttk.Style
+        nstyle = ttk.Style()
+        nstyle.theme_use("clam")
+        nstyle.configure("TNotebook", background=C_BG, borderwidth=0)
+        nstyle.configure("TNotebook.Tab", background=C_PANEL, foreground=C_SUB,
+                          padding=[16, 4], font=("Segoe UI", 10))
+        nstyle.map("TNotebook.Tab",
+                    background=[("selected", C_BORDER), ("active", "#1C2844")],
+                    foreground=[("selected", C_TEAL)])
+
+        notebook = ttk.Notebook(self)
+        notebook.pack(fill="both", expand=True, padx=10, pady=(6, 0))
+
+        self._convert_frame = ConvertFrame(notebook, self)
+        self._align_frame = AlignFrame(notebook, self)
+
+        notebook.add(self._convert_frame, text="  Convert  ")
+        notebook.add(self._align_frame, text="  Align  ")
+
+        # Cross-link so Convert can auto-fill Align's input
+        self._convert_frame._align_frame = self._align_frame
+        self._align_frame._convert_frame = self._convert_frame
+
+        # Start polling both tabs
+        self.after(150, self._poll_tabs)
+
+    def _poll_tabs(self):
+        self._convert_frame._poll()
+        self._align_frame._poll()
+        self.after(150, self._poll_tabs)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
