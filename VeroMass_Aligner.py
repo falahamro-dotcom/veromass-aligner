@@ -1466,12 +1466,12 @@ def _detect_worker(args):
     idx, path, cache_dir, peak_params = args
     _noop = lambda *a, **k: None
     try:
-        peaks, ms2_scans, kind = extract_peaks_and_ms2(path, cache_dir, peak_params, cb=_noop)
+        peaks, ms2_scans, kind, chrom = extract_peaks_and_ms2(path, cache_dir, peak_params, cb=_noop)
         for p in peaks:
             p["sample"] = idx
-        return idx, "OK", peaks, ms2_scans, kind
+        return idx, "OK", peaks, ms2_scans, kind, chrom
     except Exception as exc:
-        return idx, "ERROR", str(exc), None, None
+        return idx, "ERROR", str(exc), None, None, None
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -1581,6 +1581,7 @@ def run_alignment(
     # concatenated once, after detection, preserving order for the stable m/z sort.
     peak_chunks = []
     all_ms2_by_sample = {}
+    chrom_by_sample = {}
     n_ok = 0
     n_done = 0
     n_peaks_total = 0
@@ -1589,7 +1590,7 @@ def run_alignment(
 
     def _collect(rec):
         nonlocal n_ok, n_done, n_peaks_total
-        idx, status, a, b, c = rec
+        idx, status, a, b, c, d = rec
         n_done += 1
         name = os.path.basename(files[idx])
         if status == "ERROR":
@@ -1598,6 +1599,8 @@ def run_alignment(
             peak_chunks.append(PeakStore.from_dicts(a))   # a=peaks (dicts freed after)
             n_peaks_total += len(a)
             all_ms2_by_sample[idx] = b                    # b=ms2_scans, c=kind
+            if d is not None:
+                chrom_by_sample[idx] = d                  # d=chrom (None for MGF samples)
             n_ok += 1
             flog(f"[{idx + 1}/{total}] {name}: {c}; {len(a)} peaks.", "OK")
         log_q.put(("STAT", (n_done, n_ok, n_peaks_total,
@@ -1664,6 +1667,26 @@ def run_alignment(
 
     flog("Computing per-sample RT correction from anchor features…")
     corrections = compute_rt_correction(store, features, n_samples)
+    # Capture the deviation curve BEFORE apply_rt_correction mutates store.rt
+    # in place — evaluated at each sample's own observed peak RTs (not an
+    # arbitrary grid), which is what a scientist actually wants to see: how
+    # much correction was applied across the RTs that sample really has
+    # peaks at, downsampled the same way _summarize_chromatogram is.
+    rtcorr_by_sample = {}
+    for s in range(n_samples):
+        sample_mask = store.sample == s
+        if not np.any(sample_mask):
+            continue
+        rts = np.unique(store.rt[sample_mask])
+        if rts.size == 0:
+            continue
+        if rts.size > _CHROM_MAX_POINTS:
+            rts = rts[np.linspace(0, rts.size - 1, _CHROM_MAX_POINTS).astype(int)]
+        fn = corrections[s]
+        rtcorr_by_sample[s] = {
+            "rtRaw": [round(float(rt), 4) for rt in rts],
+            "rtDeviation": [round(float(fn(float(rt)) - rt), 5) for rt in rts],
+        }
     apply_rt_correction(store, corrections)
 
     flog("Re-grouping on RT-corrected peaks…")
@@ -1680,7 +1703,10 @@ def run_alignment(
     flog(f"  {n_with_ms2}/{len(features)} feature(s) matched to an MS2 spectrum.")
 
     flog("Writing Excel output…")
-    out_path, peaks_csv = write_feature_table(store, features, sample_names, out_dir)
+    out_path, peaks_csv = write_feature_table(
+        store, features, sample_names, out_dir,
+        chrom_by_sample=chrom_by_sample, rtcorr_by_sample=rtcorr_by_sample,
+    )
     flog(f"Output written: {out_path}", "OK")
     if peaks_csv:
         flog(f"Per-peak table written separately (too large for a worksheet): {peaks_csv}", "OK")
@@ -1757,14 +1783,41 @@ def expand_inputs(paths, work_dir, cb=None, _depth=0):
     return uniq
 
 
+_CHROM_MAX_POINTS = 400  # downsample cap for exported TIC/BPI traces — see _summarize_chromatogram
+
+
+def _summarize_chromatogram(ms1, max_points=_CHROM_MAX_POINTS):
+    """TIC (per-scan summed intensity) and BPI (per-scan max intensity) traces
+    from the same ms1 scan list peak detection already parses — this is new
+    aggregation, not a second parse: ms1 is already in memory here and is
+    about to be handed to detect_chrom_peaks and then discarded, so this is
+    the only point in the whole pipeline where it's cheap to capture.
+    Uniformly downsampled to `max_points` scans (not every scan — a run can
+    have tens of thousands, and this is for a diagnostic chart, not
+    quantitation) by even stride, which preserves the trace's shape without
+    needing a smoothing/binning step. Returns None for an empty scan list
+    (e.g. every scan in the file failed to parse) so callers can tell
+    "no chromatogram" apart from "empty but present" cleanly."""
+    if not ms1:
+        return None
+    n = len(ms1)
+    stride = max(1, n // max_points)
+    idx = range(0, n, stride)
+    rt = [round(float(ms1[i]["rt_min"]), 4) for i in idx]
+    tic = [round(float(ms1[i]["inten"].sum()), 1) if ms1[i]["inten"].size else 0.0 for i in idx]
+    bpi = [round(float(ms1[i]["inten"].max()), 1) if ms1[i]["inten"].size else 0.0 for i in idx]
+    return {"rt": rt, "tic": tic, "bpi": bpi}
+
+
 def extract_peaks_and_ms2(path, cache_dir, peak_params, cb=None):
-    """Produce (peaks, ms2_scans, kind_label) for one file, dispatching on type.
-    MGF spectra are used directly as peaks (no chromatographic detection);
-    mzML/mzXML/RAW go through full peak detection."""
+    """Produce (peaks, ms2_scans, kind_label, chrom) for one file, dispatching
+    on type. MGF spectra are used directly as peaks (no chromatographic
+    detection, and no RT axis to build a chromatogram from — chrom is None);
+    mzML/mzXML/RAW go through full peak detection and DO get a chrom trace."""
     ext = Path(path).suffix.lower()
     if ext == ".mgf":
         spectra = read_mgf_spectra(path, cb)
-        return peaks_from_mgf(spectra), spectra, f"{len(spectra):,} MGF spectra"
+        return peaks_from_mgf(spectra), spectra, f"{len(spectra):,} MGF spectra", None
     if ext == ".mzml":
         ms1, ms2 = read_ms_scans_mzml(path, cb)
     elif ext == ".mzxml":
@@ -1774,8 +1827,9 @@ def extract_peaks_and_ms2(path, cache_dir, peak_params, cb=None):
         ms1, ms2 = read_ms_scans_mzml(mzml_path, cb)
     else:
         raise ValueError(f"Unsupported file type: {ext}")
+    chrom = _summarize_chromatogram(ms1)
     peaks = detect_chrom_peaks(ms1, peak_params, cb=cb)
-    return peaks, ms2, f"{len(ms1)} MS1 / {len(ms2)} MS2 scans"
+    return peaks, ms2, f"{len(ms1)} MS1 / {len(ms2)} MS2 scans", chrom
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -1945,15 +1999,24 @@ PEAK_COLUMNS = ["feature", "sample", "m.z", "RT", "Height", "Area", "S.N"]
 PEAKS_XLSX_MAX_ROWS = 100_000
 
 
-def write_feature_table(store, features, sample_names, out_dir):
+def write_feature_table(store, features, sample_names, out_dir, chrom_by_sample=None, rtcorr_by_sample=None):
     """
-    Writes three sheets:
-      Features    — one row per aligned feature (cross-sample summary + MS2)
-      Peaks       — one row per detected peak per sample per feature: the
-                    full list of detected m/z, RT, and intensity (height/area)
-                    across every chromatogram used in the alignment
-      Intensities — wide per-sample intensity matrix (one column per sample),
-                    convenient for stats tools that expect a matrix layout
+    Writes three sheets, plus two/three optional ones when the caller supplies
+    chromatogram/RT-correction data (run_alignment always does; a caller that
+    omits them — e.g. an older script still calling this directly — just gets
+    the original three sheets, unchanged):
+      Features       — one row per aligned feature (cross-sample summary + MS2)
+      Peaks          — one row per detected peak per sample per feature: the
+                       full list of detected m/z, RT, and intensity (height/area)
+                       across every chromatogram used in the alignment
+      Intensities    — wide per-sample intensity matrix (one column per sample),
+                       convenient for stats tools that expect a matrix layout
+      TIC / BPI      — long-format per-sample chromatogram traces (rt_min,
+                       intensity), downsampled to _CHROM_MAX_POINTS scans —
+                       absent for samples with no scan-level data (MGF input).
+      RT_Correction  — long-format per-sample (rt_raw_min, rt_deviation_min)
+                       — the correction actually applied during alignment,
+                       captured before it was applied (see run_alignment).
     """
     out_path = os.path.join(out_dir, "aligned_features.xlsx")
     feature_rows = []
@@ -2036,6 +2099,26 @@ def write_feature_table(store, features, sample_names, out_dir):
         peaks_csv_path = os.path.join(out_dir, "aligned_peaks.csv")
         df_peaks.to_csv(peaks_csv_path, index=False)
         sheets = [("Features", df_feat), ("Intensities", df_int)]
+
+    if chrom_by_sample:
+        tic_rows, bpi_rows = [], []
+        for s, chrom in chrom_by_sample.items():
+            name = sample_names[s]
+            for rt, tic, bpi in zip(chrom["rt"], chrom["tic"], chrom["bpi"]):
+                tic_rows.append({"sample": name, "rt_min": rt, "intensity": tic})
+                bpi_rows.append({"sample": name, "rt_min": rt, "intensity": bpi})
+        if tic_rows:
+            sheets.append(("TIC", pd.DataFrame(tic_rows, columns=["sample", "rt_min", "intensity"])))
+            sheets.append(("BPI", pd.DataFrame(bpi_rows, columns=["sample", "rt_min", "intensity"])))
+
+    if rtcorr_by_sample:
+        rtcorr_rows = []
+        for s, curve in rtcorr_by_sample.items():
+            name = sample_names[s]
+            for rt_raw, rt_dev in zip(curve["rtRaw"], curve["rtDeviation"]):
+                rtcorr_rows.append({"sample": name, "rt_raw_min": rt_raw, "rt_deviation_min": rt_dev})
+        if rtcorr_rows:
+            sheets.append(("RT_Correction", pd.DataFrame(rtcorr_rows, columns=["sample", "rt_raw_min", "rt_deviation_min"])))
 
     with pd.ExcelWriter(out_path, engine="openpyxl") as writer:
         for sheet_name, df in sheets:
@@ -2658,6 +2741,119 @@ class App(tk.Tk):
 
 
 # ═════════════════════════════════════════════════════════════════════════════
+# HEADLESS ENTRY POINT (VeroMass Desktop embedded mode)
+# ═════════════════════════════════════════════════════════════════════════════
+# Additive only — calls the exact same run_alignment()/write_feature_table()
+# the GUI's AlignFrame._start() calls (see that function for the reference
+# call shape this mirrors), just with a plain stdout JSON-lines sink instead
+# of a Tkinter queue consumer. No algorithm code above this point is touched
+# or duplicated. Reached ONLY via --headless; every other invocation (zero
+# args, from source or the standalone installer/exe) behaves exactly as
+# before this was added.
+def run_headless(argv):
+    import argparse
+    import json as _json
+    import queue as _queue
+
+    parser = argparse.ArgumentParser(prog="VeroMass_Aligner.py --headless")
+    parser.add_argument("--folder", required=True, help="Folder of MS files to align")
+    parser.add_argument("--out", required=True, help="Output folder")
+    parser.add_argument("--recurse", action="store_true")
+    parser.add_argument("--ppm", type=float, default=None)
+    parser.add_argument("--peak-min-sec", type=float, default=None)
+    parser.add_argument("--peak-max-sec", type=float, default=None)
+    parser.add_argument("--snr", type=float, default=None)
+    parser.add_argument("--noise", type=float, default=None)
+    parser.add_argument("--grp-ppm", type=float, default=None)
+    parser.add_argument("--rt-bw-sec", type=float, default=None)
+    parser.add_argument("--min-frac-samples", type=float, default=None)
+    args = parser.parse_args(argv)
+
+    # This build is --windowed (console=False, see VeroMass_Aligner.spec) —
+    # sys.stdout is only ever None here if launched with no attached I/O
+    # handle at all (e.g. double-clicked). VeroMass Desktop always spawns
+    # this with a real piped stdout, so that path is expected to have a
+    # valid stream — but if it doesn't, the whole JSON-lines protocol this
+    # function speaks has nowhere to go, so fail loudly to a log file
+    # instead of crashing on print()'s AttributeError. Same class of bug,
+    # same fix convention as veromass-bridge/bridge.py's _ensure_stdio().
+    if sys.stdout is None:
+        log_dir = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "VeroMass_Aligner")
+        os.makedirs(log_dir, exist_ok=True)
+        sys.stdout = open(os.path.join(log_dir, "headless_no_stdio.log"), "a", buffering=1)
+        sys.stdout.write("--headless invoked with no attached stdout handle — check the caller.\n")
+        return 1
+
+    def emit(obj):
+        print(_json.dumps(obj), flush=True)
+
+    folder = args.folder
+    out_dir = args.out
+    if not folder or not os.path.isdir(folder):
+        emit({"type": "error", "message": f"Not a valid folder: {folder!r}"})
+        return 1
+    os.makedirs(out_dir, exist_ok=True)
+
+    files = scan_input_files(folder, args.recurse)
+    if not files:
+        emit({"type": "error", "message": "No mzML/mzXML/MGF files found."})
+        return 1
+
+    # Same defaulting behavior as the GUI: an unset field falls through to
+    # PeakDetectionParams/GroupingParams' own defaults (which is also what
+    # the GUI's widgets are pre-seeded from) — see PeakDetectionParams/
+    # GroupingParams above.
+    peak_kwargs = {k: v for k, v in {
+        "ppm": args.ppm, "peak_min_sec": args.peak_min_sec,
+        "peak_max_sec": args.peak_max_sec, "snr_thresh": args.snr,
+        "noise": args.noise,
+    }.items() if v is not None}
+    grp_kwargs = {k: v for k, v in {
+        "mz_ppm": args.grp_ppm, "rt_bw_sec": args.rt_bw_sec,
+        "min_frac_samples": args.min_frac_samples,
+    }.items() if v is not None}
+    peak_params = PeakDetectionParams(**peak_kwargs)
+    grp_params = GroupingParams(**grp_kwargs)
+
+    # run_alignment() only ever calls log_q.put(...) — a queue.Queue is not
+    # required, any object with a matching .put() works. This shim just
+    # forwards each message straight to stdout as JSON instead of buffering
+    # for a GUI poll loop, since headless mode runs run_alignment()
+    # synchronously on the main thread (no Tkinter event loop to keep
+    # responsive, so no need for the GUI's separate worker-thread + queue
+    # dance — same function, simpler caller).
+    class _StdoutSink:
+        def put(self, item):
+            kind, payload = item
+            if kind == "LOG":
+                level, msg = payload
+                emit({"type": "log", "level": level, "message": msg})
+            elif kind == "STAT":
+                idx, done, features, eta = payload
+                emit({"type": "progress", "index": idx, "done": done,
+                      "features": features, "eta": eta})
+            elif kind == "DONE":
+                emit({"type": "done"})
+
+    stop_ev = threading.Event()
+    pause_ev = threading.Event()
+    pause_ev.set()
+
+    try:
+        # skip_conversion=True matches the GUI's Align tab (AlignFrame._start,
+        # the same call this mirrors) — RAW->mzML conversion is a separate
+        # Convert-tab step, not part of run_alignment itself.
+        run_alignment(files, out_dir, peak_params, grp_params,
+                      stop_ev, pause_ev, _StdoutSink(), skip_conversion=True)
+        xlsx_path = os.path.join(out_dir, "aligned_features.xlsx")
+        emit({"type": "result", "xlsx_path": xlsx_path})
+        return 0
+    except Exception as e:
+        emit({"type": "error", "message": str(e)})
+        return 1
+
+
+# ═════════════════════════════════════════════════════════════════════════════
 # ENTRY POINT
 # ═════════════════════════════════════════════════════════════════════════════
 if __name__ == "__main__":
@@ -2666,5 +2862,10 @@ if __name__ == "__main__":
     # A no-op when running from source; must be the first thing in __main__.
     import multiprocessing
     multiprocessing.freeze_support()
+
+    import sys
+    if len(sys.argv) > 1 and sys.argv[1] == "--headless":
+        sys.exit(run_headless(sys.argv[2:]))
+
     app = App()
     app.mainloop()
