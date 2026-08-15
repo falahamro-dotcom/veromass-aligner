@@ -70,7 +70,7 @@ from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
 # Constants
 # ═════════════════════════════════════════════════════════════════════════════
 TOOL_NAME     = "VeroMass Aligner"
-VERSION       = "1.11.2"
+VERSION       = "1.11.3"
 OUTPUT_SUBDIR = "VeroMass_Aligner_Output"
 MS_EXTS = (".mzml", ".mzxml", ".raw", ".mgf")   # directly-readable MS files
 ARCHIVE_EXTS = (".zip",)                          # extracted, then scanned for MS_EXTS
@@ -1509,6 +1509,37 @@ def run_alignment(
 
     def cb(msg, level="INFO"):
         flog(msg, level)
+
+    # Clear stale output from a PRIOR run in this same folder before starting.
+    # A scientist re-running alignment into a folder that already has output
+    # (e.g. re-processing after adding files, or just re-running) is a normal,
+    # expected workflow — not something to guard against by refusing to run.
+    # But leaving the OLD .ready marker and aligned_features.xlsx sitting
+    # there while the new run is still in progress is a real hazard for any
+    # caller that watches this folder for completion (see VeroMass Desktop's
+    # embedded flow, run_alignment_embedded/AlignPanel.jsx): a naive
+    # "does .ready exist" check has no way to tell a stale marker from a
+    # fresh one, and this run can legitimately take minutes, leaving a wide
+    # window where a watcher could pick up the PREVIOUS run's stale, smaller,
+    # or differently-scoped result instead of waiting for this one. Deleting
+    # the prior run's terminal artifacts up front — before any new peak
+    # detection starts — closes that window entirely: for the whole duration
+    # of this run, "does .ready exist" can only ever mean "this run finished."
+    # Scoped to the specific known output filenames, never the whole
+    # directory, so a scientist's own files placed alongside the output
+    # (unlikely but not impossible) are never touched.
+    _stale_names = (".ready", ".ready.tmp", "aligned_features.xlsx", "aligned_peaks.csv")
+    _cleared = []
+    for _name in _stale_names:
+        _p = os.path.join(out_dir, _name)
+        if os.path.exists(_p):
+            try:
+                os.remove(_p)
+                _cleared.append(_name)
+            except OSError as exc:
+                flog(f"Could not remove stale {_name} from a previous run: {exc}", "WARN")
+    if _cleared:
+        flog(f"Cleared stale output from a previous run: {', '.join(_cleared)}")
 
     flog("=" * 60)
     flog(f"{TOOL_NAME} v{VERSION} — Started")
