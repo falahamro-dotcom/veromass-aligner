@@ -70,7 +70,7 @@ from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
 # Constants
 # ═════════════════════════════════════════════════════════════════════════════
 TOOL_NAME     = "VeroMass Aligner"
-VERSION       = "1.11.1"
+VERSION       = "1.11.2"
 OUTPUT_SUBDIR = "VeroMass_Aligner_Output"
 MS_EXTS = (".mzml", ".mzxml", ".raw", ".mgf")   # directly-readable MS files
 ARCHIVE_EXTS = (".zip",)                          # extracted, then scanned for MS_EXTS
@@ -2769,23 +2769,52 @@ def run_headless(argv):
     parser.add_argument("--min-frac-samples", type=float, default=None)
     args = parser.parse_args(argv)
 
-    # This build is --windowed (console=False, see VeroMass_Aligner.spec) —
-    # sys.stdout is only ever None here if launched with no attached I/O
-    # handle at all (e.g. double-clicked). VeroMass Desktop always spawns
-    # this with a real piped stdout, so that path is expected to have a
-    # valid stream — but if it doesn't, the whole JSON-lines protocol this
-    # function speaks has nowhere to go, so fail loudly to a log file
-    # instead of crashing on print()'s AttributeError. Same class of bug,
-    # same fix convention as veromass-bridge/bridge.py's _ensure_stdio().
+    # This build is --windowed (console=False, see VeroMass_Aligner.spec).
+    # Checking `sys.stdout is None` alone is NOT sufficient: a --windowed
+    # PyInstaller build launched without a real attached console can hand
+    # back a non-None stdout object that still raises
+    # `OSError: [Errno 22] Invalid argument` on the first write (observed in
+    # production — see run_headless's own log_q.put -> emit chain crashing
+    # with that exact error even though `sys.stdout is not None`). A bare
+    # identity check missed that case entirely and let the whole run die
+    # uncaught partway through. Detect a broken stream by actually writing
+    # to it, not just checking whether it exists, and fall back to a log
+    # file either way. Same class of bug, same fix convention as
+    # veromass-bridge/bridge.py's _ensure_stdio().
+    log_dir = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "VeroMass_Aligner")
+    _stdout_broken = False
     if sys.stdout is None:
-        log_dir = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "VeroMass_Aligner")
+        _stdout_broken = True
+    else:
+        try:
+            sys.stdout.write("")
+            sys.stdout.flush()
+        except OSError:
+            _stdout_broken = True
+    if _stdout_broken:
         os.makedirs(log_dir, exist_ok=True)
         sys.stdout = open(os.path.join(log_dir, "headless_no_stdio.log"), "a", buffering=1)
-        sys.stdout.write("--headless invoked with no attached stdout handle — check the caller.\n")
+        sys.stdout.write("--headless invoked with no usable stdout handle — check the caller.\n")
         return 1
 
     def emit(obj):
-        print(_json.dumps(obj), flush=True)
+        # Defensive: even after the startup check above passes, a LONG-RUNNING
+        # headless run (this can take minutes) can still hit a transient
+        # OSError on a later write if the caller's pipe goes away mid-run
+        # (e.g. the parent process's stdout reader is torn down). Losing that
+        # one JSON line is far better than the whole alignment run crashing
+        # uncaught after several minutes of real work — fall back to the same
+        # on-disk log used above instead of propagating.
+        line = _json.dumps(obj)
+        try:
+            print(line, flush=True)
+        except OSError:
+            try:
+                os.makedirs(log_dir, exist_ok=True)
+                with open(os.path.join(log_dir, "headless_no_stdio.log"), "a", buffering=1, encoding="utf-8") as fh:
+                    fh.write(line + "\n")
+            except OSError:
+                pass
 
     folder = args.folder
     out_dir = args.out
